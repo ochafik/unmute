@@ -123,16 +123,30 @@ const getVoiceName = (voice: VoiceSample) => {
   );
 };
 
+// OpenAI Realtime API native voices
+const OPENAI_VOICES = [
+  { name: "Alloy", id: "alloy" },
+  { name: "Ash", id: "ash" },
+  { name: "Ballad", id: "ballad" },
+  { name: "Coral", id: "coral" },
+  { name: "Echo", id: "echo" },
+  { name: "Sage", id: "sage" },
+  { name: "Shimmer", id: "shimmer" },
+  { name: "Verse", id: "verse" },
+];
+
 const UnmuteConfigurator = ({
   config,
   backendServerUrl,
   setConfig,
   voiceCloningUp,
+  openaiMode = false,
 }: {
   config: UnmuteConfig;
   backendServerUrl: string;
   setConfig: (config: UnmuteConfig) => void;
   voiceCloningUp: boolean;
+  openaiMode?: boolean;
 }) => {
   const [voices, setVoices] = useState<VoiceSample[] | null>(null);
   const [customVoiceName, setCustomVoiceName] = useState<string | null>(null);
@@ -263,32 +277,54 @@ const UnmuteConfigurator = ({
         <div className="w-full max-w-6xl grid grid-flow-row grid-cols-1 md:grid-cols-2 gap-3 p-3">
           <div>
             <div className="grid grid-flow-row grid-cols-2 md:grid-cols-3 gap-3">
-              {voices &&
-                voices.map((voice) => (
-                  <SquareButton
-                    key={voice.source.path_on_server}
-                    onClick={() => {
-                      setConfig({
-                        voice: voice.source.path_on_server,
-                        voiceName: voice.name || "Unnamed",
-                        instructions:
-                          customInstructions ||
-                          voice.instructions ||
-                          DEFAULT_UNMUTE_CONFIG.instructions,
-                        isCustomInstructions: !!customInstructions,
-                      });
-                    }}
-                    kind={
-                      voice.source.path_on_server === config.voice
-                        ? "primary"
-                        : "secondary"
-                    }
-                    extraClasses="bg-gray md:bg-black"
-                  >
-                    {"/ " + getVoiceName(voice) + " /"}
-                  </SquareButton>
-                ))}
-              {voiceCloningUp && (
+              {openaiMode
+                ? // OpenAI mode: show OpenAI native voices
+                  OPENAI_VOICES.map((voice) => (
+                    <SquareButton
+                      key={voice.id}
+                      onClick={() => {
+                        setConfig({
+                          voice: voice.id,
+                          voiceName: voice.name,
+                          instructions:
+                            customInstructions ||
+                            DEFAULT_UNMUTE_CONFIG.instructions,
+                          isCustomInstructions: !!customInstructions,
+                        });
+                      }}
+                      kind={voice.id === config.voice ? "primary" : "secondary"}
+                      extraClasses="bg-gray md:bg-black"
+                    >
+                      {"/ " + voice.name + " /"}
+                    </SquareButton>
+                  ))
+                : // Local mode: show custom voices from backend
+                  voices &&
+                  voices.map((voice) => (
+                    <SquareButton
+                      key={voice.source.path_on_server}
+                      onClick={() => {
+                        setConfig({
+                          voice: voice.source.path_on_server,
+                          voiceName: voice.name || "Unnamed",
+                          instructions:
+                            customInstructions ||
+                            voice.instructions ||
+                            DEFAULT_UNMUTE_CONFIG.instructions,
+                          isCustomInstructions: !!customInstructions,
+                        });
+                      }}
+                      kind={
+                        voice.source.path_on_server === config.voice
+                          ? "primary"
+                          : "secondary"
+                      }
+                      extraClasses="bg-gray md:bg-black"
+                    >
+                      {"/ " + getVoiceName(voice) + " /"}
+                    </SquareButton>
+                  ))}
+              {voiceCloningUp && !openaiMode && (
                 <VoiceUpload
                   backendServerUrl={backendServerUrl}
                   onCustomVoiceUpload={onCustomVoiceUpload}

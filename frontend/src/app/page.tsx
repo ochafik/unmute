@@ -1,9 +1,9 @@
-import Unmute from "./Unmute";
+import UnmuteWrapper from "./UnmuteWrapper";
 
 export default function Home() {
   return (
     <div className="w-full h-screen flex justify-center bg-background">
-      <Unmute />
+      <UnmuteWrapper />
     </div>
   );
 }

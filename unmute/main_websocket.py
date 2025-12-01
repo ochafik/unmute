@@ -41,6 +41,9 @@ from unmute.kyutai_constants import (
     KYUTAI_LLM_API_KEY,
     LLM_SERVER,
     MAX_VOICE_FILE_SIZE_MB,
+    OPENAI_REALTIME_API_KEY,
+    OPENAI_REALTIME_AUDIO_FORMAT,
+    OPENAI_REALTIME_MODEL,
     SAMPLE_RATE,
     STT_SERVER,
     TTS_SERVER,
@@ -139,11 +142,15 @@ class HealthStatus(BaseModel):
     stt_up: bool
     llm_up: bool
     voice_cloning_up: bool
+    # OpenAI Realtime mode availability
+    openai_realtime_available: bool = False
+    openai_realtime_audio_format: str = "pcm16"
 
     @computed_field
     @property
     def ok(self) -> bool:
         # Note that voice cloning is not required for the server to be healthy.
+        # OpenAI Realtime is an alternative mode, so also not required.
         return self.tts_up and self.stt_up and self.llm_up
 
 
@@ -187,6 +194,8 @@ async def _get_health(
         stt_up=stt_up_res,
         llm_up=llm_up_res,
         voice_cloning_up=voice_cloning_up_res,
+        openai_realtime_available=bool(OPENAI_REALTIME_API_KEY),
+        openai_realtime_audio_format=OPENAI_REALTIME_AUDIO_FORMAT,
     )
 
 
@@ -329,6 +338,138 @@ async def websocket_route(websocket: WebSocket):
 
             mt.ACTIVE_SESSIONS.dec()
             mt.SESSION_DURATION.observe(session_watch.time())
+
+
+# =============================================================================
+# OpenAI Realtime API Endpoint
+# =============================================================================
+
+
+@app.websocket("/v1/realtime/openai")
+async def websocket_route_openai(websocket: WebSocket):
+    """WebSocket endpoint for OpenAI Realtime API mode.
+
+    This endpoint connects the browser directly to OpenAI's Realtime API,
+    bypassing the local STT/TTS services. Requires OPENAI_REALTIME_API_KEY.
+
+    Audio format depends on OPENAI_REALTIME_AUDIO_FORMAT:
+    - "pcm16" (default): Browser sends/receives base64 PCM16 at 24kHz
+    - "opus": Browser sends/receives Opus (converted at backend)
+    """
+    if not OPENAI_REALTIME_API_KEY:
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason="OpenAI Realtime API key not configured",
+        )
+        return
+
+    mt.SESSIONS.inc()
+    mt.ACTIVE_SESSIONS.inc()
+    session_watch = Stopwatch()
+
+    async with SEMAPHORE:
+        try:
+            await websocket.accept(subprotocol="realtime")
+
+            from unmute.openai_realtime.handler import OpenAIRealtimeHandler
+
+            handler = OpenAIRealtimeHandler(
+                api_key=OPENAI_REALTIME_API_KEY,
+                model=OPENAI_REALTIME_MODEL,
+                audio_format=OPENAI_REALTIME_AUDIO_FORMAT,
+            )
+            async with handler:
+                await handler.start_up()
+                await _run_openai_route(websocket, handler)
+
+        except Exception as exc:
+            await _report_websocket_exception(websocket, exc)
+        finally:
+            mt.ACTIVE_SESSIONS.dec()
+            mt.SESSION_DURATION.observe(session_watch.time())
+
+
+async def _run_openai_route(websocket: WebSocket, handler):
+    """Run the OpenAI Realtime route."""
+    from unmute.openai_realtime.handler import OpenAIRealtimeHandler
+
+    handler: OpenAIRealtimeHandler = handler
+
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(
+                _openai_receive_loop(websocket, handler), name="openai_receive_loop()"
+            )
+            tg.create_task(
+                _openai_emit_loop(websocket, handler), name="openai_emit_loop()"
+            )
+    finally:
+        await handler.cleanup()
+        logger.info("OpenAI realtime route finished")
+
+
+async def _openai_receive_loop(websocket: WebSocket, handler):
+    """Receive messages from browser and forward to OpenAI handler."""
+    from unmute.openai_realtime.handler import OpenAIRealtimeHandler
+
+    handler: OpenAIRealtimeHandler = handler
+
+    while True:
+        try:
+            message_raw = await websocket.receive_text()
+        except WebSocketDisconnect as e:
+            logger.info(f"OpenAI receive_loop disconnected: {e.code=} {e.reason=}")
+            raise WebSocketClosedError() from e
+        except RuntimeError as e:
+            if "WebSocket is not connected" not in str(e):
+                raise
+            logger.info("OpenAI receive_loop disconnected")
+            raise WebSocketClosedError() from e
+
+        try:
+            message = ClientEventAdapter.validate_json(message_raw)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON from client: {e}")
+            continue
+        except ValidationError as e:
+            logger.warning(f"Invalid client event: {e}")
+            continue
+
+        # Handle different message types
+        if isinstance(message, ora.InputAudioBufferAppend):
+            # Forward audio to OpenAI
+            await handler.receive_audio(message.audio)
+        elif isinstance(message, ora.SessionUpdate):
+            # Update session configuration
+            await handler.update_session(message.session)
+
+
+async def _openai_emit_loop(websocket: WebSocket, handler):
+    """Emit events from OpenAI handler to browser."""
+    while True:
+        if (
+            websocket.application_state == WebSocketState.DISCONNECTED
+            or websocket.client_state == WebSocketState.DISCONNECTED
+        ):
+            logger.info("OpenAI emit_loop disconnected")
+            raise WebSocketClosedError()
+
+        event = await handler.emit()
+        if event is None:
+            continue
+
+        # Handle raw audio tuples (for compatibility)
+        if isinstance(event, tuple):
+            sr, audio = event
+            # This shouldn't happen in OpenAI mode, but handle it
+            logger.warning("Received raw audio tuple in OpenAI mode")
+            continue
+
+        try:
+            await websocket.send_text(event.model_dump_json())
+        except (WebSocketDisconnect, RuntimeError) as e:
+            logger.info(f"OpenAI emit_loop send failed: {e}")
+            raise WebSocketClosedError() from e
 
 
 async def _report_websocket_exception(websocket: WebSocket, exc: Exception):

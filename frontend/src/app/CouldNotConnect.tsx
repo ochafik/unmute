@@ -8,6 +8,9 @@ export type HealthStatus = {
   stt_up?: boolean;
   llm_up?: boolean;
   voice_cloning_up?: boolean;
+  // OpenAI Realtime mode
+  openai_realtime_available?: boolean;
+  openai_realtime_audio_format?: "pcm16" | "opus";
 };
 
 const renderServiceStatus = (

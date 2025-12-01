@@ -38,3 +38,16 @@ SAMPLES_PER_FRAME = 1920
 FRAME_TIME_SEC = SAMPLES_PER_FRAME / SAMPLE_RATE  # 0.08
 # TODO: make it so that we can read this from the ASR server?
 STT_DELAY_SEC = 0.5
+
+# =============================================================================
+# OpenAI Realtime API Configuration
+# =============================================================================
+# Set OPENAI_REALTIME_API_KEY to enable OpenAI Realtime mode
+OPENAI_REALTIME_API_KEY = os.environ.get("OPENAI_REALTIME_API_KEY")
+OPENAI_REALTIME_MODEL = os.environ.get(
+    "OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview"
+)
+# Audio format for OpenAI mode: "pcm16" (optimal) or "opus" (backward compat)
+OPENAI_REALTIME_AUDIO_FORMAT = os.environ.get(
+    "OPENAI_REALTIME_AUDIO_FORMAT", "pcm16"
+)
