@@ -33,8 +33,8 @@ graph LR
 > If something isn't working for you, don't hesistate to open an issue. We'll do our best to help you figure out what's wrong.
 
 Requirements:
-- Hardware: a GPU with CUDA support and at least 16 GB memory.
-- OS: Linux, or Windows with WSL ([installation instructions](https://ubuntu.com/desktop/wsl)). Running on Windows natively is not supported (see [#84](https://github.com/kyutai-labs/unmute/issues/84)). Neither is running on Mac (see [#74](https://github.com/kyutai-labs/unmute/issues/74)).
+- Hardware: A GPU with CUDA support and at least 16 GB memory, OR an Apple Silicon Mac with at least 16 GB unified memory.
+- OS: Linux, Windows with WSL ([installation instructions](https://ubuntu.com/desktop/wsl)), or macOS with Apple Silicon (see [Apple Silicon Setup](#running-on-apple-silicon-macos)). Running on Windows natively is not supported (see [#84](https://github.com/kyutai-labs/unmute/issues/84)).
 
 We provide multiple ways of deploying your own [unmute.sh](unmute.sh):
 
@@ -42,6 +42,7 @@ We provide multiple ways of deploying your own [unmute.sh](unmute.sh):
 |---------------------------|----------------|--------------------|------------|------------|----------------|
 | Docker Compose            | 1+             | 1                  | Very easy  |✅         |✅              |
 | Dockerless                | 1 to 3         | 1 to 5             | Easy       |✅         |✅              |
+| Apple Silicon (Metal)     | 1 (unified)    | 1                  | Easy       |✅         |❌              |
 | Docker Swarm              | 1 to ~100      | 1 to ~100          | Medium     |✅         |❌              |
 
 
@@ -132,6 +133,58 @@ Start each of the services one by one in a different tmux session or terminal:
 ./dockerless/start_tts.sh        # Needs 5.3GB of vram
 ```
 And the website should be accessible at `http://localhost:3000`.
+
+### Running on Apple Silicon (macOS)
+
+Unmute can run on Apple Silicon Macs (M1/M2/M3/M4) using Metal GPU acceleration. This requires the dockerless setup since Docker on macOS doesn't support GPU passthrough.
+
+#### Requirements
+
+- **Hardware**: Apple Silicon Mac (M1/M2/M3/M4) with at least 16GB unified memory (32GB+ recommended)
+- **OS**: macOS 13 (Ventura) or later
+
+#### Software requirements
+
+* `uv`: Install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
+* `cargo`: Install with `curl https://sh.rustup.rs -sSf | sh`
+* `pnpm`: Install with `curl -fsSL https://get.pnpm.io/install.sh | sh -`
+* `llama.cpp`: Install with `brew install llama.cpp` (requires [Homebrew](https://brew.sh/))
+
+#### Running the services
+
+**Quick start** - Run all services with a single command:
+```bash
+./dockerless/start_all_metal.sh
+```
+This will start all services, wait for them to be ready, and open your browser automatically. Press `Ctrl+C` to stop all services. Logs are saved in `./logs/`.
+
+**Manual start** - Start each service in a different terminal or tmux session:
+```bash
+./dockerless/start_frontend.sh
+./dockerless/start_backend.sh
+./dockerless/start_llm_metal.sh    # Uses llama-server with Metal
+./dockerless/start_stt_metal.sh    # Uses moshi-server with Metal
+./dockerless/start_tts_metal.sh    # Uses moshi-server with Metal
+```
+
+The website should be accessible at `http://localhost:3000`.
+
+#### Memory usage
+
+With quantized models (Q4_K_M), approximate memory usage:
+- LLM: ~2GB (Llama-3.2-1B quantized)
+- STT: ~2.5GB
+- TTS: ~5.3GB
+- **Total**: ~10GB
+
+#### Customizing the LLM
+
+You can customize the LLM model by setting environment variables before running `start_llm_metal.sh`:
+```bash
+export UNMUTE_LLM_MODEL="meta-llama/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"
+export UNMUTE_LLM_CONTEXT_SIZE=4096
+./dockerless/start_llm_metal.sh
+```
 
 ### Connecting to a remote server running Unmute
 
