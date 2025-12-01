@@ -22,6 +22,10 @@ fi
 # This allows TTS to run on Apple Silicon, with some ops falling back to CPU
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 
+# Disable torch.compile as the Metal backend is experimental and has bugs
+# See: https://github.com/pytorch/pytorch/issues/150121
+export NO_TORCH_COMPILE=1
+
 # Find a suitable system Python (not miniforge/conda which lacks proper framework paths)
 # Priority: homebrew Intel > homebrew ARM > system Python
 SYSTEM_PYTHON=""
@@ -45,14 +49,21 @@ export PYO3_PYTHON="$SYSTEM_PYTHON"
 PYTHON_BIN_DIR=$(dirname "$SYSTEM_PYTHON")
 export PATH="$PYTHON_BIN_DIR:$PATH"
 
-# Install moshi-server with Metal features instead of CUDA
+# Install moshi-server with Metal features
 # Use --locked to ensure compatible dependency versions
 # If you already have moshi-server installed and things are not working because of a
 # prior CUDA build, you might have to force a rebuild with --force.
-$CARGO install --features metal --locked moshi-server@0.6.4
+# Note: For MPS scatter_ fix, we need ochafik/moshi fork's apple-silicon-tts branch
+MOSHI_SERVER_FORK="$HOME/github/moshi/rust/moshi-server"
+if [ -d "$MOSHI_SERVER_FORK" ]; then
+    echo "Installing moshi-server from local fork..."
+    $CARGO install --features metal --locked --path "$MOSHI_SERVER_FORK"
+else
+    echo "Installing moshi-server from crates.io (may lack MPS fixes)..."
+    $CARGO install --features metal --locked moshi-server@0.6.4
+fi
 
-# Install Python dependencies needed for TTS to the system Python
-# The moshi package includes torch for Metal/MPS support
-$SYSTEM_PYTHON -m pip install --quiet moshi huggingface_hub pydantic julius sentencepiece safetensors 2>/dev/null || true
+# Install Python dependencies from pyproject.toml with MPS extras (includes moshi fork)
+$SYSTEM_PYTHON -m pip install --quiet "./dockerless[mps]" 2>/dev/null || true
 
 ~/.cargo/bin/moshi-server worker --config services/moshi-server/configs/tts.toml --port 8089

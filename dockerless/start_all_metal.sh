@@ -156,8 +156,8 @@ start_service "STT (moshi-server)" \
     "./dockerless/start_stt_metal.sh" \
     "$LOGS_DIR/stt.log"
 
-start_service "TTS (moshi-server)" \
-    "./dockerless/start_tts_metal.sh" \
+start_service "TTS (moshi-server MLX)" \
+    "./dockerless/start_tts_mlx.sh" \
     "$LOGS_DIR/tts.log"
 
 start_service "Backend (FastAPI)" \
