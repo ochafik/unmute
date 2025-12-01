@@ -152,6 +152,29 @@ quantize = 8   # Default: good balance of speed and quality
 # quantize = 0   # No quantization (slowest, highest quality)
 ```
 
+### TTS Audio Artifacts
+
+If you experience audio artifacts (crackling, noise bursts) at the start of TTS responses or after you stop speaking, try these options:
+
+1. **Disable quantization** (best quality, slower):
+   ```toml
+   # In services/moshi-server/configs/tts_mlx.toml
+   # quantize = 8  # Comment out this line
+   ```
+
+2. **Use 4-bit quantization** (different artifact pattern):
+   ```toml
+   quantize = 4
+   ```
+
+3. **Disable noise-based warmup** (if noise warmup causes issues):
+   ```bash
+   export UNMUTE_TTS_WARMUP_ZEROS=1
+   ./dockerless/start_all_metal.sh
+   ```
+
+**Technical background:** The MLX TTS uses a streaming neural audio codec (Mimi) with causal convolutions. When quantized models transition from silence to speech, the streaming buffers can produce transient artifacts. The default noise-based warmup helps prime these buffers, but disabling quantization provides the cleanest audio.
+
 ## Troubleshooting
 
 ### TTS not working

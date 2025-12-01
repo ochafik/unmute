@@ -123,26 +123,156 @@ echo -e "${BLUE}Starting Unmute with Metal acceleration${NC}"
 echo -e "${BLUE}======================================${NC}"
 echo ""
 
-# Check prerequisites
-echo -e "${YELLOW}Checking prerequisites...${NC}"
+# =============================================================================
+# Prerequisite Checks
+# =============================================================================
 
-if ! command -v llama-server &> /dev/null; then
-    echo -e "${RED}Error: llama-server not found. Install with: brew install llama.cpp${NC}"
-    exit 1
-fi
+check_prerequisites() {
+    local errors=0
+    local warnings=0
 
-if ! command -v cargo &> /dev/null; then
-    echo -e "${RED}Error: cargo not found. Install Rust from https://rustup.rs${NC}"
-    exit 1
-fi
+    echo -e "${YELLOW}Checking prerequisites...${NC}"
+    echo ""
 
-if ! command -v pnpm &> /dev/null; then
-    echo -e "${RED}Error: pnpm not found. Install with: curl -fsSL https://get.pnpm.io/install.sh | sh -${NC}"
-    exit 1
-fi
+    # --- Python 3.12 (Homebrew) ---
+    echo -n "  Python 3.12 (Homebrew): "
+    SYSTEM_PYTHON=""
+    for p in /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+        if [ -x "$p" ]; then
+            SYSTEM_PYTHON="$p"
+            break
+        fi
+    done
 
-echo -e "${GREEN}Prerequisites OK${NC}"
-echo ""
+    if [ -z "$SYSTEM_PYTHON" ]; then
+        echo -e "${RED}NOT FOUND${NC}"
+        echo -e "    ${RED}→ Install with: brew install python@3.12${NC}"
+        errors=$((errors + 1))
+    else
+        PYTHON_VERSION=$($SYSTEM_PYTHON --version 2>&1 | awk '{print $2}')
+        # Check if it's a conda/miniforge Python (these lack proper framework paths for pyo3)
+        if [[ "$SYSTEM_PYTHON" == *"miniforge"* ]] || [[ "$SYSTEM_PYTHON" == *"conda"* ]]; then
+            echo -e "${RED}CONDA DETECTED${NC}"
+            echo -e "    ${RED}→ Homebrew Python required (not conda/miniforge)${NC}"
+            echo -e "    ${RED}→ Run: conda deactivate && brew install python@3.12${NC}"
+            errors=$((errors + 1))
+        else
+            echo -e "${GREEN}OK${NC} ($SYSTEM_PYTHON, v$PYTHON_VERSION)"
+        fi
+    fi
+
+    # --- Rust (via rustup) ---
+    echo -n "  Rust (rustup): "
+    if ! command -v rustup &> /dev/null; then
+        echo -e "${RED}NOT FOUND${NC}"
+        echo -e "    ${RED}→ Install with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh${NC}"
+        echo -e "    ${RED}→ Then run: source ~/.cargo/env${NC}"
+        errors=$((errors + 1))
+    else
+        RUSTUP_VERSION=$(rustup --version 2>&1 | head -1)
+        echo -e "${GREEN}OK${NC} ($RUSTUP_VERSION)"
+    fi
+
+    # --- Rust 1.84.0 (required for moshi-server) ---
+    echo -n "  Rust 1.84.0: "
+    if ! rustup run 1.84.0 cargo --version &>/dev/null; then
+        echo -e "${RED}NOT INSTALLED${NC}"
+        echo -e "    ${RED}→ Install with: rustup install 1.84.0${NC}"
+        echo -e "    ${YELLOW}  (Required due to const eval changes in newer Rust versions)${NC}"
+        errors=$((errors + 1))
+    else
+        echo -e "${GREEN}OK${NC}"
+    fi
+
+    # --- llama-server (llama.cpp) ---
+    echo -n "  llama-server: "
+    if ! command -v llama-server &> /dev/null; then
+        echo -e "${RED}NOT FOUND${NC}"
+        echo -e "    ${RED}→ Install with: brew install llama.cpp${NC}"
+        errors=$((errors + 1))
+    else
+        echo -e "${GREEN}OK${NC}"
+    fi
+
+    # --- pnpm ---
+    echo -n "  pnpm: "
+    if ! command -v pnpm &> /dev/null; then
+        echo -e "${RED}NOT FOUND${NC}"
+        echo -e "    ${RED}→ Install with: curl -fsSL https://get.pnpm.io/install.sh | sh -${NC}"
+        errors=$((errors + 1))
+    else
+        PNPM_VERSION=$(pnpm --version 2>&1)
+        echo -e "${GREEN}OK${NC} (v$PNPM_VERSION)"
+    fi
+
+    # --- uv (Python package manager) ---
+    echo -n "  uv: "
+    if ! command -v uv &> /dev/null; then
+        echo -e "${YELLOW}NOT FOUND (optional)${NC}"
+        echo -e "    ${YELLOW}→ Recommended: curl -LsSf https://astral.sh/uv/install.sh | sh${NC}"
+        warnings=$((warnings + 1))
+    else
+        UV_VERSION=$(uv --version 2>&1 | awk '{print $2}')
+        echo -e "${GREEN}OK${NC} (v$UV_VERSION)"
+    fi
+
+    # --- moshi fork ---
+    echo -n "  moshi fork: "
+    MOSHI_FORK="$HOME/github/moshi"
+    if [ ! -d "$MOSHI_FORK/rust/moshi-server" ]; then
+        echo -e "${RED}NOT FOUND${NC}"
+        echo -e "    ${RED}→ Clone with:${NC}"
+        echo -e "    ${RED}    mkdir -p ~/github${NC}"
+        echo -e "    ${RED}    git clone https://github.com/ochafik/moshi.git ~/github/moshi${NC}"
+        echo -e "    ${RED}    cd ~/github/moshi && git checkout apple-silicon-tts${NC}"
+        errors=$((errors + 1))
+    else
+        # Check if on correct branch
+        MOSHI_BRANCH=$(cd "$MOSHI_FORK" && git branch --show-current 2>/dev/null || echo "unknown")
+        if [ "$MOSHI_BRANCH" != "apple-silicon-tts" ]; then
+            echo -e "${YELLOW}WRONG BRANCH${NC} (on '$MOSHI_BRANCH')"
+            echo -e "    ${YELLOW}→ Switch with: cd ~/github/moshi && git checkout apple-silicon-tts${NC}"
+            warnings=$((warnings + 1))
+        else
+            echo -e "${GREEN}OK${NC} ($MOSHI_FORK, branch: $MOSHI_BRANCH)"
+        fi
+    fi
+
+    # --- Check for conflicting processes on required ports ---
+    echo ""
+    echo -n "  Port availability: "
+    local port_conflicts=""
+    for port in 8089 8090 8091 8000 3000; do
+        if lsof -i :$port &>/dev/null; then
+            port_conflicts="$port_conflicts $port"
+        fi
+    done
+    if [ -n "$port_conflicts" ]; then
+        echo -e "${YELLOW}PORTS IN USE:${port_conflicts}${NC}"
+        echo -e "    ${YELLOW}→ Stop existing services or use: pkill -f moshi-server; pkill -f llama-server; pkill -f uvicorn; pkill -f 'next dev'${NC}"
+        warnings=$((warnings + 1))
+    else
+        echo -e "${GREEN}OK${NC} (8089, 8090, 8091, 8000, 3000 available)"
+    fi
+
+    echo ""
+
+    # --- Summary ---
+    if [ $errors -gt 0 ]; then
+        echo -e "${RED}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${RED}  $errors prerequisite(s) missing. Please install them first.${NC}"
+        echo -e "${RED}  See README.metal.md for full setup instructions.${NC}"
+        echo -e "${RED}══════════════════════════════════════════════════════════════${NC}"
+        exit 1
+    elif [ $warnings -gt 0 ]; then
+        echo -e "${YELLOW}Prerequisites OK with $warnings warning(s)${NC}"
+    else
+        echo -e "${GREEN}All prerequisites OK${NC}"
+    fi
+    echo ""
+}
+
+check_prerequisites
 
 # Start all services
 echo -e "${YELLOW}Starting services (logs in $LOGS_DIR/)...${NC}"
