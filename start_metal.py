@@ -226,7 +226,9 @@ def start_llm_service(log_file: Path) -> subprocess.Popen:
     """Start LLM service (llama-server)"""
     print_color(BLUE, "Starting LLM (llama-server)...")
 
-    model = os.getenv('UNMUTE_LLM_MODEL', 'bartowski/Llama-3.2-1B-Instruct-GGUF:Llama-3.2-1B-Instruct-Q4_K_M.gguf')
+    # model = os.getenv('UNMUTE_LLM_MODEL', 'bartowski/Llama-3.2-1B-Instruct-GGUF:Llama-3.2-1B-Instruct-Q4_K_M.gguf')
+    model = os.getenv('UNMUTE_LLM_MODEL', 'unsloth/Qwen3-Coder-30B-A3B-Instruct-1M-GGUF:UD-Q4_K_XL')
+    # model = os.getenv('UNMUTE_LLM_MODEL', 'bartowski/Codestral-22B-v0.1-GGUF')
     context_size = os.getenv('UNMUTE_LLM_CONTEXT_SIZE', '8192')
     port = SERVICE_PORTS['llm']
 
@@ -237,6 +239,8 @@ def start_llm_service(log_file: Path) -> subprocess.Popen:
                 '-hf', model,
                 '-c', context_size,
                 '-ngl', '-1',  # Offload all to GPU (Metal)
+                '--jinja',
+                '--verbose',
                 '--port', str(port),
                 '--host', '0.0.0.0'
             ],
@@ -252,7 +256,7 @@ def start_llm_service(log_file: Path) -> subprocess.Popen:
 
 def start_moshi_service(service_type: str, log_file: Path, mlx: bool = False) -> subprocess.Popen:
     """Start moshi-server for STT or TTS"""
-    service_name = f"{'TTS (MLX)' if mlx else 'TTS (Metal)'}" if service_type == 'tts' else "STT"
+    service_name = f"{'TTS (MLX)' if mlx else 'TTS (PyTorch)'}" if service_type == 'tts' else "STT"
     print_color(BLUE, f"Starting {service_name} (moshi-server)...")
 
     # Get system Python for PYO3
