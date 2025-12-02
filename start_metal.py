@@ -13,10 +13,12 @@ This script orchestrates all Unmute services with native Metal acceleration by:
 - No Docker required - everything runs with Metal acceleration
 
 Usage:
-    ./start_metal.py                                  # Start with Metal TTS (localhost)
+    ./start_metal.py                                  # Start with MLX TTS
     UNMUTE_HOST=192.168.1.100 ./start_metal.py        # Start on specific host for network access
-    MLX_TTS=1 ./start_metal.py                        # Start with MLX TTS (experimental)
+    MLX_TTS=0 ./start_metal.py                        # Start with PyTorch Metal TTS
 
+    
+To quantize: add `quantize = 8` in modules.tts_py.py in services/moshi-server/configs/tts_mlx.toml
 
 Prerequisites:
 - uv (fast Python package manager for backend):
@@ -538,7 +540,7 @@ def main() -> None:
     print_color(BLUE, "======================================")
     print()
 
-    mlx_tts = os.getenv('MLX_TTS') == '1'
+    mlx_tts = os.getenv('MLX_TTS', '1') == '1'
 
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
