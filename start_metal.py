@@ -267,8 +267,8 @@ def start_moshi_service(service_type: str, log_file: Path, mlx: bool = False) ->
     env['CMAKE_POLICY_VERSION_MINIMUM'] = "3.5"
     env['PYTORCH_ENABLE_MPS_FALLBACK'] = "1"
 
-    # if service_type == 'tts':
-    #     env['NO_TORCH_COMPILE'] = "1"
+    if service_type == 'tts':
+        env['NO_TORCH_COMPILE'] = "1"
 
     # Determine cargo command
     cargo_cmd = "cargo"
