@@ -309,16 +309,31 @@ def start_moshi_service(service_type: str, log_file: Path, mlx: bool = False) ->
         print_color(RED, f"  ERROR installing moshi-server: {e.stderr.decode()}")
         sys.exit(1)
 
-    # Install Python dependencies for TTS if using MLX
-    if service_type == 'tts' and mlx:
-        print("  Installing MLX dependencies...")
-        pip_cmd = "uv pip install" if check_command("uv") else f"{system_python} -m pip install"
+    # Install Python dependencies for TTS (moshi-server embeds Python)
+    if service_type == 'tts':
+        print("  Installing Python dependencies...")
+
+        # Use Homebrew Python's pip (moshi-server needs these in the embedded interpreter)
+        pip_cmd = f"{system_python} -m pip"
+
+        # Install TTS dependencies (PyTorch, HuggingFace Hub, etc.)
+        # These are needed by tts.py which runs inside moshi-server via PyO3
+        core_deps = "huggingface_hub pydantic safetensors torch numpy"
         subprocess.run(
-            f'{pip_cmd} --quiet "./dockerless[mlx]"',
+            f'{pip_cmd} install --quiet {core_deps}',
             shell=True,
             env=env,
             capture_output=True,
         )
+
+        # Additional MLX dependencies
+        if mlx:
+            subprocess.run(
+                f'{pip_cmd} install --quiet "mlx>=0.4.0" sentencepiece julius',
+                shell=True,
+                env=env,
+                capture_output=True,
+            )
 
     # Start moshi-server
     config_file = f"services/moshi-server/configs/{'tts_mlx' if mlx else service_type}.toml"
