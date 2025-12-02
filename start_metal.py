@@ -13,8 +13,9 @@ This script orchestrates all Unmute services with native Metal acceleration by:
 - No Docker required - everything runs with Metal acceleration
 
 Usage:
-    ./start_metal.py              # Start with Metal TTS
-    MLX_TTS=1 ./start_metal.py    # Start with MLX TTS (experimental)
+    ./start_metal.py                                  # Start with Metal TTS (localhost)
+    UNMUTE_HOST=192.168.1.100 ./start_metal.py        # Start on specific host for network access
+    MLX_TTS=1 ./start_metal.py                        # Start with MLX TTS (experimental)
 
 
 Prerequisites:
@@ -266,8 +267,8 @@ def start_moshi_service(service_type: str, log_file: Path, mlx: bool = False) ->
     env['CMAKE_POLICY_VERSION_MINIMUM'] = "3.5"
     env['PYTORCH_ENABLE_MPS_FALLBACK'] = "1"
 
-    if service_type == 'tts':
-        env['NO_TORCH_COMPILE'] = "1"
+    # if service_type == 'tts':
+    #     env['NO_TORCH_COMPILE'] = "1"
 
     # Determine cargo command
     cargo_cmd = "cargo"
@@ -285,7 +286,7 @@ def start_moshi_service(service_type: str, log_file: Path, mlx: bool = False) ->
     print(f"  Installing moshi-server...")
     install_cmd = cargo_cmd.split() + ["install", "--features", "metal", "--locked"]
 
-    if MOSHI_LOCAL_PATH.exists():
+    if False and MOSHI_LOCAL_PATH.exists():
         print(f"    Using local fork: {MOSHI_LOCAL_PATH}")
         install_cmd += ["--path", str(MOSHI_LOCAL_PATH)]
     else:
@@ -346,11 +347,14 @@ def start_backend_service(log_file: Path) -> subprocess.Popen:
     """Start backend service (FastAPI via uvicorn)"""
     print_color(BLUE, "Starting Backend (FastAPI)...")
 
-    # Set service URLs to localhost since everything runs natively
+    # Get host from environment (defaults to localhost)
+    host = os.getenv('UNMUTE_HOST', 'localhost')
+
+    # Set service URLs
     env = os.environ.copy()
-    env['KYUTAI_STT_URL'] = f"ws://localhost:{SERVICE_PORTS['stt']}"
-    env['KYUTAI_TTS_URL'] = f"ws://localhost:{SERVICE_PORTS['tts']}"
-    env['KYUTAI_LLM_URL'] = f"http://localhost:{SERVICE_PORTS['llm']}"
+    env['KYUTAI_STT_URL'] = f"ws://{host}:{SERVICE_PORTS['stt']}"
+    env['KYUTAI_TTS_URL'] = f"ws://{host}:{SERVICE_PORTS['tts']}"
+    env['KYUTAI_LLM_URL'] = f"http://{host}:{SERVICE_PORTS['llm']}"
 
     cmd = ["uv", "run"] if check_command("uv") else [sys.executable, "-m"]
     cmd.extend([
@@ -429,6 +433,9 @@ def start_all_services(mlx_tts: bool = False) -> bool:
     """Start all Metal-accelerated services"""
     LOGS_DIR.mkdir(exist_ok=True)
 
+    # Get host for health checks (defaults to localhost)
+    host = os.getenv('UNMUTE_HOST', 'localhost')
+
     print_color(YELLOW, f"\nStarting services (logs in {LOGS_DIR}/)...\n")
 
     # Start services
@@ -445,11 +452,11 @@ def start_all_services(mlx_tts: bool = False) -> bool:
 
     # Wait for health checks
     services = [
-        ('LLM', 'http://localhost:8091/health', 180),
-        ('STT', 'http://localhost:8090/api/build_info', 300),
-        ('TTS', 'http://localhost:8089/api/build_info', 300),
-        ('Backend', 'http://localhost:8000/health', 120),
-        ('Frontend', 'http://localhost:3000', 120),
+        ('LLM', f'http://{host}:8091/health', 180),
+        ('STT', f'http://{host}:8090/api/build_info', 300),
+        ('TTS', f'http://{host}:8089/api/build_info', 300),
+        ('Backend', f'http://{host}:8000/health', 120),
+        ('Frontend', f'http://{host}:3000', 120),
     ]
 
     all_ready = all(wait_for_service(name, url, max_attempts) for name, url, max_attempts in services)
@@ -494,16 +501,19 @@ def cleanup(signum: object = None, frame: object = None) -> None:
 
 def open_browser() -> None:
     """Open browser to the frontend"""
-    print_color(BLUE, "Opening browser...")
+    host = os.getenv('UNMUTE_HOST', 'localhost')
+    url = f"http://{host}:3000"
+
+    print_color(BLUE, f"Opening browser to {url}...")
     try:
         if sys.platform == 'darwin':
-            subprocess.run(['open', 'http://localhost:3000'], check=False)
+            subprocess.run(['open', url], check=False)
         elif sys.platform.startswith('linux'):
-            subprocess.run(['xdg-open', 'http://localhost:3000'], check=False)
+            subprocess.run(['xdg-open', url], check=False)
         else:
-            print_color(YELLOW, "Please open http://localhost:3000 in your browser")
+            print_color(YELLOW, f"Please open {url} in your browser")
     except:
-        print_color(YELLOW, "Please open http://localhost:3000 in your browser")
+        print_color(YELLOW, f"Please open {url} in your browser")
 
 
 def main() -> None:
