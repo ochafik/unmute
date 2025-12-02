@@ -15,6 +15,24 @@ This script orchestrates all Unmute services with native Metal acceleration by:
 Usage:
     ./start_metal.py              # Start with Metal TTS
     MLX_TTS=1 ./start_metal.py    # Start with MLX TTS (experimental)
+
+
+Prerequisites:
+- uv (fast Python package manager for backend):
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+- Homebrew:
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+- Python 3.12 (MUST be Homebrew Python, not conda/miniforge):
+    brew install python@3.12
+- Rust (via rustup):
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    source ~/.cargo/env
+- Rust 1.84.0:
+    rustup install 1.84.0
+- llama.cpp (provides llama-server):
+    brew install llama.cpp
+- pnpm (for frontend):
+    curl -fsSL https://get.pnpm.io/install.sh | sh -
 """
 
 import os
