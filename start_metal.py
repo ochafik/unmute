@@ -238,8 +238,10 @@ def start_llm_service(log_file: Path) -> subprocess.Popen:
                 'llama-server',
                 '-hf', model,
                 '-c', context_size,
+                '--offline',
                 '-ngl', '-1',  # Offload all to GPU (Metal)
                 '--jinja',
+                '--reasoning-budget', '0',  # Disable thinking
                 '--verbose',
                 '--port', str(port),
                 '--host', '0.0.0.0'
@@ -272,6 +274,8 @@ def start_moshi_service(service_type: str, log_file: Path, mlx: bool = False) ->
     env['CXXFLAGS'] = "-include cstdint"
     env['CMAKE_POLICY_VERSION_MINIMUM'] = "3.5"
     env['PYTORCH_ENABLE_MPS_FALLBACK'] = "1"
+    # Ensure Python output is not buffered (fixes TTS service appearing stuck)
+    env['PYTHONUNBUFFERED'] = "1"
 
     if service_type == 'tts':
         env['NO_TORCH_COMPILE'] = "1"
