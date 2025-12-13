@@ -30,6 +30,10 @@ from unmute.llm.chatbot import Chatbot
 from unmute.llm.llm_utils import (
     INTERRUPTION_CHAR,
     USER_SILENCE_MARKER,
+    LLMStreamItem,
+    TextDelta,
+    ToolCallComplete,
+    ToolCallDelta,
     VLLMStream,
     get_openai_client,
     rechunk_to_words,
@@ -102,6 +106,11 @@ class UnmuteHandler(AsyncStreamHandler):
         self.openai_client = get_openai_client()
 
         self.turn_transition_lock = asyncio.Lock()
+
+        # Tool calling support
+        self.tools: list[dict[str, Any]] | None = None
+        self.tool_choice: str | dict[str, Any] | None = None
+        self._waiting_for_tool_result: str | None = None  # call_id we're waiting for
 
         self.debug_dict: dict[str, Any] = {
             "timing": {},
@@ -184,6 +193,7 @@ class UnmuteHandler(AsyncStreamHandler):
     async def _generate_response_task(self):
         generating_message_i = len(self.chatbot.chat_history)
 
+        response_id = ora.random_id("resp")
         await self.output_queue.put(
             ora.ResponseCreated(
                 response=ora.Response(
@@ -204,6 +214,8 @@ class UnmuteHandler(AsyncStreamHandler):
             temperature=FIRST_MESSAGE_TEMPERATURE
             if generating_message_i == 2
             else FURTHER_MESSAGES_TEMPERATURE,
+            tools=self.tools,
+            tool_choice=self.tool_choice,
         )
 
         messages = self.chatbot.preprocessed_messages()
@@ -221,38 +233,125 @@ class UnmuteHandler(AsyncStreamHandler):
         mt.VLLM_REQUEST_LENGTH.observe(num_words_sent)
         mt.VLLM_ACTIVE_SESSIONS.inc()
 
+        # Track tool calls for this response
+        tool_calls_emitted: dict[int, ora.FunctionCallItem] = {}
+        has_tool_calls = False
+
         try:
-            async for delta in rechunk_to_words(llm.chat_completion(messages)):
+            async for item in llm.chat_completion_with_tools(messages):
+                if isinstance(item, TextDelta):
+                    # Handle text content - rechunk to words for TTS
+                    delta = item.content
+
+                    # Rechunk to words inline (simplified version)
+                    await self.output_queue.put(
+                        ora.UnmuteResponseTextDeltaReady(delta=delta)
+                    )
+
+                    mt.VLLM_RECV_WORDS.inc()
+                    response_words.append(delta)
+
+                    if time_to_first_token is None:
+                        time_to_first_token = llm_stopwatch.time()
+                        self.debug_dict["timing"]["to_first_token"] = time_to_first_token
+                        mt.VLLM_TTFT.observe(time_to_first_token)
+                        logger.info("Sending first word to TTS: %s", delta)
+
+                    self.tts_output_stopwatch.start_if_not_started()
+                    try:
+                        tts = await quest.get()
+                    except Exception:
+                        error_from_tts = True
+                        raise
+
+                    if len(self.chatbot.chat_history) > generating_message_i:
+                        break  # We've been interrupted
+
+                    await tts.send(delta)
+
+                elif isinstance(item, ToolCallDelta):
+                    has_tool_calls = True
+                    # Create FunctionCallItem if this is the first delta for this tool call
+                    if item.index not in tool_calls_emitted:
+                        func_item = ora.FunctionCallItem(
+                            name=item.name,
+                            call_id=item.id,
+                        )
+                        tool_calls_emitted[item.index] = func_item
+
+                        # Emit output_item.added event
+                        await self.output_queue.put(
+                            ora.ResponseOutputItemAdded(
+                                response_id=response_id,
+                                output_index=item.index,
+                                item=func_item,
+                            )
+                        )
+
+                    # Emit streaming arguments delta
+                    await self.output_queue.put(
+                        ora.ResponseFunctionCallArgumentsDelta(
+                            response_id=response_id,
+                            item_id=tool_calls_emitted[item.index].id,
+                            output_index=item.index,
+                            call_id=item.id,
+                            delta=item.arguments_delta,
+                        )
+                    )
+
+                elif isinstance(item, ToolCallComplete):
+                    has_tool_calls = True
+                    # Emit function_call_arguments.done
+                    func_item = tool_calls_emitted.get(item.index)
+                    if func_item is None:
+                        # Shouldn't happen, but create one just in case
+                        func_item = ora.FunctionCallItem(
+                            name=item.name,
+                            call_id=item.id,
+                        )
+                        tool_calls_emitted[item.index] = func_item
+
+                    func_item.arguments = item.arguments
+                    func_item.status = "completed"
+
+                    await self.output_queue.put(
+                        ora.ResponseFunctionCallArgumentsDone(
+                            response_id=response_id,
+                            item_id=func_item.id,
+                            output_index=item.index,
+                            call_id=item.id,
+                            arguments=item.arguments,
+                        )
+                    )
+
+                    # Emit output_item.done
+                    await self.output_queue.put(
+                        ora.ResponseOutputItemDone(
+                            response_id=response_id,
+                            output_index=item.index,
+                            item=func_item,
+                        )
+                    )
+
+                    # Add to chat history
+                    self.chatbot.add_tool_call(item.id, item.name, item.arguments)
+                    logger.info(
+                        "Tool call: %s(%s)", item.name, item.arguments[:100] + "..."
+                        if len(item.arguments) > 100 else item.arguments
+                    )
+
+            # If we had tool calls, emit response.done and wait for results
+            if has_tool_calls:
+                await self.output_queue.put(ora.ResponseDone(response_id=response_id))
+                # Don't send TTS EOS - no audio was generated
+                logger.info("Response contains tool calls, waiting for results")
+                return
+
+            # Normal text response - emit text done and send TTS EOS
+            if response_words:
                 await self.output_queue.put(
-                    ora.UnmuteResponseTextDeltaReady(delta=delta)
+                    ora.ResponseTextDone(text="".join(response_words))
                 )
-
-                mt.VLLM_RECV_WORDS.inc()
-                response_words.append(delta)
-
-                if time_to_first_token is None:
-                    time_to_first_token = llm_stopwatch.time()
-                    self.debug_dict["timing"]["to_first_token"] = time_to_first_token
-                    mt.VLLM_TTFT.observe(time_to_first_token)
-                    logger.info("Sending first word to TTS: %s", delta)
-
-                self.tts_output_stopwatch.start_if_not_started()
-                try:
-                    tts = await quest.get()
-                except Exception:
-                    error_from_tts = True
-                    raise
-
-                if len(self.chatbot.chat_history) > generating_message_i:
-                    break  # We've been interrupted
-
-                assert isinstance(delta, str)  # make Pyright happy
-                await tts.send(delta)
-
-            await self.output_queue.put(
-                # The words include the whitespace, so no need to add it here
-                ora.ResponseTextDone(text="".join(response_words))
-            )
 
             if tts is not None:
                 logger.info("Sending TTS EOS.")
@@ -644,8 +743,36 @@ class UnmuteHandler(AsyncStreamHandler):
         if session.voice:
             self.tts_voice = session.voice
 
+        # Handle tool calling configuration
+        if session.tools is not None:
+            self.tools = [t.to_openai_format() for t in session.tools]
+            logger.info("Session configured with %d tools", len(self.tools))
+        if session.tool_choice is not None:
+            self.tool_choice = session.tool_choice
+
         if not session.allow_recording and self.recorder:
             await self.recorder.add_event("client", ora.SessionUpdate(session=session))
             await self.recorder.shutdown(keep_recording=False)
             self.recorder = None
             logger.info("Recording disabled for a session.")
+
+    async def handle_conversation_item_create(self, event: ora.ConversationItemCreate):
+        """Handle function call result from client."""
+        item = event.item
+        if isinstance(item, ora.FunctionCallOutputItem):
+            call_id = item.call_id
+            output = item.output
+            self.chatbot.add_tool_result(call_id, output)
+            logger.info("Received tool result for call_id=%s", call_id)
+        elif isinstance(item, dict) and item.get("type") == "function_call_output":
+            call_id = item["call_id"]
+            output = item["output"]
+            self.chatbot.add_tool_result(call_id, output)
+            logger.info("Received tool result for call_id=%s", call_id)
+        else:
+            logger.warning("Unknown conversation item type: %s", type(item))
+
+    async def handle_response_create(self, event: ora.ResponseCreate):
+        """Client requests response generation (typically after providing tool result)."""
+        logger.info("Client requested response generation")
+        await self._generate_response()

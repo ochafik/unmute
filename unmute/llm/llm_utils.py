@@ -1,6 +1,7 @@
 import os
 import re
 from copy import deepcopy
+from dataclasses import dataclass, field
 from functools import cache
 from typing import Any, AsyncIterator, Protocol, cast
 
@@ -11,29 +12,92 @@ from unmute.kyutai_constants import LLM_SERVER
 
 from ..kyutai_constants import KYUTAI_LLM_API_KEY, KYUTAI_LLM_MODEL
 
+
+# =============================================================================
+# LLM Response Types (for tool calling support)
+# =============================================================================
+
+
+@dataclass
+class TextDelta:
+    """A text content delta from the LLM."""
+
+    content: str
+
+
+@dataclass
+class ToolCallDelta:
+    """A streaming delta for a tool call's arguments."""
+
+    index: int
+    id: str
+    name: str  # May be empty for subsequent deltas
+    arguments_delta: str
+
+
+@dataclass
+class ToolCallComplete:
+    """A complete tool call from the LLM."""
+
+    index: int
+    id: str
+    name: str
+    arguments: str
+
+
+# Type for what chat_completion_with_tools yields
+LLMStreamItem = TextDelta | ToolCallDelta | ToolCallComplete
+
+
+@dataclass
+class ToolCallAccumulator:
+    """Accumulates streaming tool call data."""
+
+    id: str = ""
+    name: str = ""
+    arguments: str = ""
+
 INTERRUPTION_CHAR = "—"  # em-dash
 USER_SILENCE_MARKER = "..."
 
 
 def preprocess_messages_for_llm(
-    chat_history: list[dict[str, str]],
-) -> list[dict[str, str]]:
+    chat_history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     output = []
 
     for message in chat_history:
         message = deepcopy(message)
 
+        # Handle tool call messages (assistant messages with tool_calls but no content)
+        # and tool result messages (role="tool") - pass them through without modification
+        if message.get("tool_calls") is not None or message.get("role") == "tool":
+            output.append(message)
+            continue
+
+        content = message.get("content")
+
+        # Skip messages with None content (shouldn't happen for normal messages)
+        if content is None:
+            continue
+
         # Sometimes, an interruption happens before the LLM can say anything at all.
         # In that case, we're left with a message with only INTERRUPTION_CHAR.
         # Simplify by removing.
-        if message["content"].replace(INTERRUPTION_CHAR, "") == "":
+        if content.replace(INTERRUPTION_CHAR, "") == "":
             continue
 
         # If the llm was interrupted we don't want to insert the INTERRUPTION_CHAR
         # into the context, otherwise the LLM might want to repeat it.
-        message["content"] = message["content"].strip().removesuffix(INTERRUPTION_CHAR)
+        message["content"] = content.strip().removesuffix(INTERRUPTION_CHAR)
 
-        if output and message["role"] == output[-1]["role"]:
+        # Merge consecutive messages with the same role (but not tool-related messages)
+        if (
+            output
+            and message["role"] == output[-1].get("role")
+            and output[-1].get("tool_calls") is None
+            and output[-1].get("role") != "tool"
+        ):
             output[-1]["content"] += " " + message["content"]
         else:
             output.append(message)
@@ -49,17 +113,19 @@ def preprocess_messages_for_llm(
         output = [output[0]] + [{"role": "user", "content": "Hello."}] + output[1:]
 
     for message in chat_history:
+        content = message.get("content")
         if (
             message["role"] == "user"
-            and message["content"].startswith(USER_SILENCE_MARKER)
-            and message["content"] != USER_SILENCE_MARKER
+            and content is not None
+            and content.startswith(USER_SILENCE_MARKER)
+            and content != USER_SILENCE_MARKER
         ):
             # This happens when the user is silent but then starts talking again after
             # the silence marker was inserted but before the LLM could respond.
             # There are special instructions in the system prompt about how to handle
             # the silence marker, so remove the marker from the message to not confuse
             # the LLM
-            message["content"] = message["content"][len(USER_SILENCE_MARKER) :]
+            message["content"] = content[len(USER_SILENCE_MARKER) :]
 
     return output
 
@@ -150,34 +216,110 @@ class VLLMStream:
         self,
         client: AsyncOpenAI,
         temperature: float = 1.0,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ):
         """
         If `model` is None, it will look at the available models, and if there is only
         one model, it will use that one. Otherwise, it will raise.
+
+        Args:
+            client: AsyncOpenAI client
+            temperature: Sampling temperature
+            tools: List of tool definitions in OpenAI format
+            tool_choice: Tool choice mode ("auto", "none", "required", or specific tool)
         """
         self.client = client
         self.model = autoselect_model()
         self.temperature = temperature
+        self.tools = tools
+        self.tool_choice = tool_choice
 
     async def chat_completion(
         self, messages: list[dict[str, str]]
     ) -> AsyncIterator[str]:
-        stream = await self.client.chat.completions.create(
-            model=self.model,
-            messages=cast(Any, messages),  # Cast and hope for the best
-            stream=True,
-            temperature=self.temperature,
-        )
+        """Legacy method for text-only completion (backward compatible)."""
+        async for item in self.chat_completion_with_tools(messages):
+            if isinstance(item, TextDelta):
+                yield item.content
+
+    async def chat_completion_with_tools(
+        self, messages: list[dict[str, Any]]
+    ) -> AsyncIterator[LLMStreamItem]:
+        """
+        Stream chat completion with support for tool calls.
+
+        Yields:
+            TextDelta: For text content
+            ToolCallDelta: For streaming tool call arguments
+            ToolCallComplete: When a tool call is finished
+        """
+        params: dict[str, Any] = {
+            "model": self.model,
+            "messages": cast(Any, messages),
+            "stream": True,
+            "temperature": self.temperature,
+        }
+
+        # Add tools if configured
+        if self.tools:
+            params["tools"] = self.tools
+        if self.tool_choice is not None:
+            params["tool_choice"] = self.tool_choice
+
+        stream = await self.client.chat.completions.create(**params)
+
+        # Track tool calls being accumulated
+        tool_call_accumulators: dict[int, ToolCallAccumulator] = {}
 
         async with stream:
             async for chunk in stream:
-                chunk_content = chunk.choices[0].delta.content
-
-                if not chunk_content:
-                    # This happens on the first message, see:
-                    # https://platform.openai.com/docs/guides/streaming-responses#read-the-responses
-                    # Also ignore `null` chunks, which is what llama.cpp does:
-                    # https://github.com/ggml-org/llama.cpp/blob/6491d6e4f1caf0ad2221865b4249ae6938a6308c/tools/server/tests/unit/test_chat_completion.py#L338
+                if not chunk.choices:
                     continue
 
-                yield chunk_content
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                # Handle text content
+                if delta.content:
+                    yield TextDelta(content=delta.content)
+
+                # Handle tool calls
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+
+                        # Initialize accumulator for new tool calls
+                        if idx not in tool_call_accumulators:
+                            tool_call_accumulators[idx] = ToolCallAccumulator()
+
+                        acc = tool_call_accumulators[idx]
+
+                        # Update accumulator with new data
+                        if tc.id:
+                            acc.id = tc.id
+                        if tc.function:
+                            if tc.function.name:
+                                acc.name = tc.function.name
+                            if tc.function.arguments:
+                                acc.arguments += tc.function.arguments
+
+                                # Emit delta for streaming arguments
+                                yield ToolCallDelta(
+                                    index=idx,
+                                    id=acc.id,
+                                    name=acc.name,
+                                    arguments_delta=tc.function.arguments,
+                                )
+
+                # Check for finish reason indicating tool calls complete
+                if choice.finish_reason == "tool_calls":
+                    # Emit complete tool calls
+                    for idx, acc in sorted(tool_call_accumulators.items()):
+                        yield ToolCallComplete(
+                            index=idx,
+                            id=acc.id,
+                            name=acc.name,
+                            arguments=acc.arguments,
+                        )
+                    tool_call_accumulators.clear()

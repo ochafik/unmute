@@ -24,14 +24,22 @@ class Chatbot:
 
         last_message = self.chat_history[-1]
         if last_message["role"] == "assistant":
+            # Check if this is a tool call (no text content, but has tool_calls)
+            if last_message.get("tool_calls"):
+                # Waiting for tool result from client
+                return "waiting_for_user"
             return "bot_speaking"
         elif last_message["role"] == "user":
-            if last_message["content"].strip() != "":
+            content = last_message.get("content", "")
+            if content.strip() != "":
                 return "user_speaking"
             else:
                 # Or do we want "user_speaking" here?
                 return "waiting_for_user"
         elif last_message["role"] == "system":
+            return "waiting_for_user"
+        elif last_message["role"] == "tool":
+            # Tool result received, ready for assistant response
             return "waiting_for_user"
         else:
             raise RuntimeError(f"Unknown role: {last_message['role']}")
@@ -113,9 +121,39 @@ class Chatbot:
         valid_messages = [
             message
             for message in self.chat_history
-            if message["role"] == role and message["content"].strip() != ""
+            if message["role"] == role
+            and (content := message.get("content")) is not None
+            and content.strip() != ""
         ]
         if valid_messages:
             return valid_messages[-1]["content"]
         else:
             return None
+
+    def add_tool_call(self, call_id: str, name: str, arguments: str) -> None:
+        """Add assistant's tool call to history.
+
+        This represents the LLM requesting to call a tool/function.
+        """
+        self.chat_history.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }
+                ],
+            }
+        )
+
+    def add_tool_result(self, call_id: str, output: str) -> None:
+        """Add tool result to history.
+
+        This represents the result of executing a tool call.
+        """
+        self.chat_history.append(
+            {"role": "tool", "tool_call_id": call_id, "content": output}
+        )
