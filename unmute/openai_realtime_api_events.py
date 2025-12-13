@@ -63,11 +63,76 @@ class Error(BaseEvent[Literal["error"]]):
     error: ErrorDetails
 
 
+# =============================================================================
+# Tool/Function Calling Types
+# =============================================================================
+
+
+class ToolFunctionParameters(BaseModel):
+    """JSON Schema for function parameters."""
+
+    type: Literal["object"] = "object"
+    properties: dict[str, Any] = Field(default_factory=dict)
+    required: list[str] = Field(default_factory=list)
+
+
+class ToolFunction(BaseModel):
+    """Function definition for a tool."""
+
+    name: str
+    description: str = ""
+    parameters: ToolFunctionParameters = Field(default_factory=ToolFunctionParameters)
+
+
+class Tool(BaseModel):
+    """Tool definition (currently only function type supported)."""
+
+    type: Literal["function"] = "function"
+    # Nested format (OpenAI standard)
+    function: ToolFunction | None = None
+    # Flat format (also accepted by OpenAI)
+    name: str | None = None
+    description: str | None = None
+    parameters: ToolFunctionParameters | None = None
+
+    def get_name(self) -> str:
+        """Get the function name from either format."""
+        if self.function:
+            return self.function.name
+        return self.name or ""
+
+    def get_description(self) -> str:
+        """Get the function description from either format."""
+        if self.function:
+            return self.function.description
+        return self.description or ""
+
+    def get_parameters(self) -> ToolFunctionParameters:
+        """Get the function parameters from either format."""
+        if self.function:
+            return self.function.parameters
+        return self.parameters or ToolFunctionParameters()
+
+    def to_openai_format(self) -> dict[str, Any]:
+        """Convert to OpenAI API format for LLM calls."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.get_name(),
+                "description": self.get_description(),
+                "parameters": self.get_parameters().model_dump(),
+            },
+        }
+
+
 class SessionConfig(BaseModel):
     # The "Instructions" object is an Unmute extension
     instructions: Instructions | None = None
     voice: str | None = None
     allow_recording: bool
+    # Tool calling support (OpenAI Realtime API compatible)
+    tools: list[Tool] | None = None
+    tool_choice: str | dict[str, Any] | None = None  # "auto", "none", "required", or {"type": "function", "function": {"name": "..."}}
 
 
 class SessionUpdate(BaseEvent[Literal["session.update"]]):
@@ -173,18 +238,112 @@ class UnmuteInterruptedByVAD(BaseEvent[Literal["unmute.interrupted_by_vad"]]):
     """The VAD interrupted the response generation."""
 
 
+# =============================================================================
+# Function Calling Events (OpenAI Realtime API compatible)
+# =============================================================================
+
+
+class FunctionCallItem(BaseModel):
+    """Represents a function call item in a response."""
+
+    id: str = Field(default_factory=lambda: random_id("item"))
+    object: Literal["realtime.item"] = "realtime.item"
+    type: Literal["function_call"] = "function_call"
+    status: Literal["in_progress", "completed"] = "in_progress"
+    name: str
+    call_id: str = Field(default_factory=lambda: random_id("call"))
+    arguments: str = ""
+
+
+class ResponseOutputItemAdded(BaseEvent[Literal["response.output_item.added"]]):
+    """Server emits when a new output item (text or function_call) is being added."""
+
+    response_id: str
+    output_index: int
+    item: FunctionCallItem | dict[str, Any]
+
+
+class ResponseFunctionCallArgumentsDelta(
+    BaseEvent[Literal["response.function_call_arguments.delta"]]
+):
+    """Streaming function call arguments as they're generated."""
+
+    response_id: str
+    item_id: str
+    output_index: int
+    call_id: str
+    delta: str  # JSON fragment
+
+
+class ResponseFunctionCallArgumentsDone(
+    BaseEvent[Literal["response.function_call_arguments.done"]]
+):
+    """Function call arguments are complete."""
+
+    response_id: str
+    item_id: str
+    output_index: int
+    call_id: str
+    arguments: str  # Complete JSON string
+
+
+class ResponseOutputItemDone(BaseEvent[Literal["response.output_item.done"]]):
+    """Output item (function_call or message) is complete."""
+
+    response_id: str
+    output_index: int
+    item: FunctionCallItem | dict[str, Any]
+
+
+class ResponseDone(BaseEvent[Literal["response.done"]]):
+    """Response is complete (all output items finished)."""
+
+    response_id: str
+
+
+# Client events for function call results
+
+
+class FunctionCallOutputItem(BaseModel):
+    """Function call result submitted by client."""
+
+    type: Literal["function_call_output"] = "function_call_output"
+    call_id: str
+    output: str  # JSON string with function result
+
+
+class ConversationItemCreate(BaseEvent[Literal["conversation.item.create"]]):
+    """Client creates a conversation item (e.g., function call result)."""
+
+    item: FunctionCallOutputItem | dict[str, Any]
+
+
+class ResponseCreate(BaseEvent[Literal["response.create"]]):
+    """Client triggers response generation (required after function call result)."""
+
+    pass
+
+
 # Server events (from OpenAI to client)
 ServerEvent = Union[
     Error,
     SessionUpdated,
+    ResponseCreated,
     ResponseTextDelta,
     ResponseTextDone,
     ResponseAudioDelta,
     ResponseAudioDone,
-    ResponseCreated,
+    ResponseDone,
+    # Function calling events
+    ResponseOutputItemAdded,
+    ResponseFunctionCallArgumentsDelta,
+    ResponseFunctionCallArgumentsDone,
+    ResponseOutputItemDone,
+    # Other events
     ConversationItemInputAudioTranscriptionDelta,
     InputAudioBufferSpeechStarted,
     InputAudioBufferSpeechStopped,
+    # Unmute extensions
     UnmuteAdditionalOutputs,
     UnmuteResponseTextDeltaReady,
     UnmuteResponseAudioDeltaReady,
@@ -195,6 +354,9 @@ ServerEvent = Union[
 ClientEvent = Union[
     SessionUpdate,
     InputAudioBufferAppend,
+    # Function calling events
+    ConversationItemCreate,
+    ResponseCreate,
     # Used internally for recording, we're not expecting the user to send this
     UnmuteInputAudioBufferAppendAnonymized,
 ]

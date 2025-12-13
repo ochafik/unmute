@@ -56,6 +56,7 @@ from unmute.tts.voice_donation import (
 )
 from unmute.tts.voices import VoiceList
 from unmute.unmute_handler import UnmuteHandler
+from unmute.protocol import NativeProtocolAdapter, OpenAIProtocolAdapter, ProtocolAdapter
 
 app = FastAPI()
 
@@ -94,6 +95,18 @@ app.add_middleware(
 @app.get("/")
 def root():
     return {"message": "You've reached the Unmute backend server."}
+
+
+@app.get("/openai-realtime-client")
+def openai_realtime_client():
+    """Serve the OpenAI Realtime API test client."""
+    import os
+    client_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "openai-realtime-client.html")
+    try:
+        with open(client_path, "r") as f:
+            return HTMLResponse(f.read())
+    except FileNotFoundError:
+        return HTMLResponse("<body>Client not found. Please ensure openai-realtime-client.html exists in the project root.</body>", status_code=404)
 
 
 if PROFILE_ACTIVE:
@@ -288,7 +301,30 @@ async def post_voice_donation(
 
 
 @app.websocket("/v1/realtime")
-async def websocket_route(websocket: WebSocket):
+async def websocket_route_native(websocket: WebSocket):
+    """Native Unmute protocol endpoint (Opus-encoded audio)."""
+    await _websocket_route_with_protocol(websocket, "native")
+
+
+@app.websocket("/v1/realtime/openai")
+async def websocket_route_openai(websocket: WebSocket, model: str = "gpt-4o-realtime-preview"):
+    """OpenAI Realtime API-compatible endpoint (PCM16-encoded audio)."""
+    await _websocket_route_with_protocol(websocket, "openai", model=model)
+
+
+async def _websocket_route_with_protocol(
+    websocket: WebSocket,
+    protocol: str,
+    model: str = "gpt-4o-realtime-preview"
+):
+    """
+    WebSocket route handler with protocol adapter support.
+
+    Args:
+        websocket: WebSocket connection
+        protocol: Protocol name ("native" or "openai")
+        model: Model name for OpenAI protocol (used for compatibility)
+    """
     global _last_profile, _current_profile
     mt.SESSIONS.inc()
     mt.ACTIVE_SESSIONS.inc()
@@ -305,22 +341,39 @@ async def websocket_route(websocket: WebSocket):
             frame = frame.f_back
         _current_profile.start(caller_frame=frame)
 
+    # Create protocol adapter
+    if protocol == "native":
+        adapter = NativeProtocolAdapter(sample_rate=SAMPLE_RATE)
+    elif protocol == "openai":
+        adapter = OpenAIProtocolAdapter(sample_rate=SAMPLE_RATE, model=model)
+    else:
+        raise ValueError(f"Unknown protocol: {protocol}")
+
     async with SEMAPHORE:
         try:
             # The `subprotocol` argument is important because the client specifies what
             # protocol(s) it supports and OpenAI uses "realtime" as the value. If we
             # don't set this, the client will think this is not the right endpoint and
             # will not connect.
-            await websocket.accept(subprotocol="realtime")
+            await websocket.accept(subprotocol=adapter.websocket_subprotocol)
+
+            # Set up protocol adapter
+            await adapter.setup()
 
             handler = UnmuteHandler()
             async with handler:
                 await handler.start_up()
-                await _run_route(websocket, handler)
+                await _run_route(websocket, handler, adapter)
 
         except Exception as exc:
             await _report_websocket_exception(websocket, exc)
         finally:
+            # Clean up protocol adapter
+            try:
+                await adapter.teardown()
+            except Exception as e:
+                logger.warning(f"Error during adapter teardown: {e}")
+
             if _current_profile is not None:
                 _current_profile.stop()
                 logger.info("Profiler saved.")
@@ -377,7 +430,7 @@ async def _report_websocket_exception(websocket: WebSocket, exc: Exception):
             logger.warning("Socket already closed.")
 
 
-async def _run_route(websocket: WebSocket, handler: UnmuteHandler):
+async def _run_route(websocket: WebSocket, handler: UnmuteHandler, adapter: ProtocolAdapter):
     health = await get_health()
     if not health.ok:
         logger.info("Health check failed, closing WebSocket connection.")
@@ -391,10 +444,10 @@ async def _run_route(websocket: WebSocket, handler: UnmuteHandler):
     try:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(
-                receive_loop(websocket, handler, emit_queue), name="receive_loop()"
+                receive_loop(websocket, handler, emit_queue, adapter), name="receive_loop()"
             )
             tg.create_task(
-                emit_loop(websocket, handler, emit_queue), name="emit_loop()"
+                emit_loop(websocket, handler, emit_queue, adapter), name="emit_loop()"
             )
             tg.create_task(handler.quest_manager.wait(), name="quest_manager.wait()")
             tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
@@ -407,13 +460,13 @@ async def receive_loop(
     websocket: WebSocket,
     handler: UnmuteHandler,
     emit_queue: asyncio.Queue[ora.ServerEvent],
+    adapter: ProtocolAdapter,
 ):
     """Receive messages from the WebSocket.
 
     Can decide to send messages via `emit_queue`.
+    Uses protocol adapter to decode audio and translate messages.
     """
-    opus_reader = sphn.OpusStreamReader(SAMPLE_RATE)
-    wait_for_first_opus = True
     while True:
         try:
             message_raw = await websocket.receive_text()
@@ -432,7 +485,13 @@ async def receive_loop(
             raise WebSocketClosedError() from e
 
         try:
-            message: ora.ClientEvent = ClientEventAdapter.validate_json(message_raw)
+            # Use protocol adapter to translate client message
+            message: ora.ClientEvent | None = adapter.translate_client_message(message_raw)
+
+            # Some messages may be filtered out by the adapter (e.g., OpenAI's response.create)
+            if message is None:
+                continue
+
         except json.JSONDecodeError as e:
             await emit_queue.put(
                 ora.Error(
@@ -458,26 +517,30 @@ async def receive_loop(
         message_to_record = message
 
         if isinstance(message, ora.InputAudioBufferAppend):
-            opus_bytes = base64.b64decode(message.audio)
-            if wait_for_first_opus:
-                # Somehow the UI is sending us potentially old messages from a previous
-                # connection on reconnect, so that we might get some old OGG packets,
-                # waiting for the bit set for first packet to feed to the decoder.
-                if opus_bytes[5] & 2:
-                    wait_for_first_opus = False
-                else:
-                    continue
-            pcm = await asyncio.to_thread(opus_reader.append_bytes, opus_bytes)
+            # Use protocol adapter to decode audio
+            audio_result = await adapter.handle_audio_message(message)
 
-            message_to_record = ora.UnmuteInputAudioBufferAppendAnonymized(
-                number_of_samples=pcm.size,
-            )
+            if audio_result is not None:
+                message_to_record = ora.UnmuteInputAudioBufferAppendAnonymized(
+                    number_of_samples=audio_result[1].size,
+                )
+                await handler.receive(audio_result)
+            else:
+                message_to_record = ora.UnmuteInputAudioBufferAppendAnonymized(
+                    number_of_samples=0,
+                )
 
-            if pcm.size:
-                await handler.receive((SAMPLE_RATE, pcm[np.newaxis, :]))
         elif isinstance(message, ora.SessionUpdate):
             await handler.update_session(message.session)
             await emit_queue.put(ora.SessionUpdated(session=message.session))
+
+        elif isinstance(message, ora.ConversationItemCreate):
+            # Handle function call outputs from client
+            await handler.handle_conversation_item_create(message)
+
+        elif isinstance(message, ora.ResponseCreate):
+            # Client requests response generation (after tool result)
+            await handler.handle_response_create(message)
 
         elif isinstance(message, ora.UnmuteAdditionalOutputs):
             # Don't record this: it's a debugging message and can be verbose. Anything
@@ -496,15 +559,21 @@ class EmitDebugLogger:
         self.last_emitted_n = 0
         self.last_emitted_type = ""
 
-    def on_emit(self, to_emit: ora.ServerEvent):
-        if self.last_emitted_type == to_emit.type:
+    def on_emit(self, to_emit):
+        # Get the type - for ora.ServerEvent use .type, for others use class name
+        if hasattr(to_emit, "type"):
+            event_type = to_emit.type
+        else:
+            event_type = type(to_emit).__name__
+
+        if self.last_emitted_type == event_type:
             self.last_emitted_n += 1
         else:
             self.last_emitted_n = 1
-            self.last_emitted_type = to_emit.type
+            self.last_emitted_type = event_type
 
         if self.last_emitted_n == 1:
-            logger.debug(f"Emitting: {to_emit.type}")
+            logger.debug(f"Emitting: {event_type}")
         else:
             logger.debug(f"Emitting ({self.last_emitted_n}): {self.last_emitted_type}")
 
@@ -513,11 +582,13 @@ async def emit_loop(
     websocket: WebSocket,
     handler: UnmuteHandler,
     emit_queue: asyncio.Queue[ora.ServerEvent],
+    adapter: ProtocolAdapter,
 ):
-    """Send messages to the WebSocket."""
-    emit_debug_logger = EmitDebugLogger()
+    """Send messages to the WebSocket.
 
-    opus_writer = sphn.OpusStreamWriter(SAMPLE_RATE)
+    Uses protocol adapter to encode audio and translate server events.
+    """
+    emit_debug_logger = EmitDebugLogger()
 
     while True:
         if (
@@ -528,42 +599,46 @@ async def emit_loop(
             raise WebSocketClosedError()
 
         try:
-            to_emit = emit_queue.get_nowait()
+            to_emit_event = emit_queue.get_nowait()
         except asyncio.QueueEmpty:
             emitted_by_handler = await handler.emit()
 
             if emitted_by_handler is None:
                 continue
-            elif isinstance(emitted_by_handler, AdditionalOutputs):
-                assert len(emitted_by_handler.args) == 1
-                to_emit = ora.UnmuteAdditionalOutputs(
-                    args=emitted_by_handler.args[0],
-                )
             elif isinstance(emitted_by_handler, CloseStream):
                 # Close here explicitly so that the receive loop stops too
                 await websocket.close()
                 break
-            elif isinstance(emitted_by_handler, ora.ServerEvent):
-                to_emit = emitted_by_handler
-            else:
-                _sr, audio = emitted_by_handler
-                audio = audio_to_float32(audio)
-                opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
-                # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
-                if opus_bytes:
-                    to_emit = ora.ResponseAudioDelta(
-                        delta=base64.b64encode(opus_bytes).decode("utf-8"),
-                    )
+            elif isinstance(emitted_by_handler, tuple):
+                # Audio tuple - use protocol adapter to encode
+                audio_event = await adapter.handle_audio_output(emitted_by_handler)
+                if audio_event is not None:
+                    to_emit_event = audio_event
                 else:
+                    # No output from encoder (e.g., buffering)
                     continue
+            else:
+                # ServerEvent or AdditionalOutputs
+                to_emit_event = emitted_by_handler
 
-        emit_debug_logger.on_emit(to_emit)
+        # Translate server event using protocol adapter
+        try:
+            to_emit_json = adapter.translate_server_event(to_emit_event)
+        except ValueError as e:
+            logger.error(f"Failed to translate server event: {e}")
+            continue
+
+        # Some events may be filtered out by the adapter
+        if to_emit_json is None:
+            continue
+
+        emit_debug_logger.on_emit(to_emit_event)
 
         if handler.recorder is not None:
-            await handler.recorder.add_event("server", to_emit)
+            await handler.recorder.add_event("server", to_emit_event)
 
         try:
-            await websocket.send_text(to_emit.model_dump_json())
+            await websocket.send_text(to_emit_json)
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):
                 if "Unexpected ASGI message 'websocket.send'" in str(e):
