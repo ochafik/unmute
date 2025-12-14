@@ -13,9 +13,12 @@ Key differences from native protocol:
 """
 
 import json
+import logging
 from typing import Optional, Tuple, Union
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 from fastrtc import AdditionalOutputs, CloseStream
 from pydantic import TypeAdapter, ValidationError
 
@@ -23,24 +26,9 @@ import unmute.openai_realtime_api_events as ora
 from unmute.protocol.audio_transcoding import decode_pcm16_base64, encode_pcm16_base64
 from unmute.protocol.base import ProtocolAdapter
 
-# OpenAI voice names that should be mapped to Kyutai "default" voice
-# These are the standard OpenAI voices. If the client sends one of these,
-# we map it to "default" since Kyutai doesn't have equivalents.
-# However, if the client sends a real Kyutai voice name (fetched from /v1/voices),
-# we pass it through unchanged.
+# Standard OpenAI voice names (for reference only - we pass all voices through unchanged)
+# Clients should use real Kyutai voice paths from /v1/voices API
 OPENAI_VOICE_NAMES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"}
-
-# For backwards compatibility, map OpenAI voice names to Kyutai "default"
-OPENAI_VOICE_MAPPING = {
-    "alloy": "default",  # Neutral, balanced
-    "ash": "default",  # Clear, expressive (OpenAI preview)
-    "ballad": "default",  # Deep, calm (OpenAI preview)
-    "coral": "default",  # Warm, friendly (OpenAI preview)
-    "echo": "default",  # Resonant, clear
-    "sage": "default",  # Soft, articulate
-    "shimmer": "default",  # Energetic, bright
-    "verse": "default",  # Conversational, engaging (OpenAI preview)
-}
 
 
 class OpenAIProtocolAdapter(ProtocolAdapter):
@@ -110,48 +98,84 @@ class OpenAIProtocolAdapter(ProtocolAdapter):
 
     def _map_openai_voice_to_kyutai(self, voice: str) -> str:
         """
-        Map OpenAI voice name to Kyutai voice name.
+        Pass through voice unchanged.
 
-        If the voice is a standard OpenAI voice name (alloy, echo, etc.),
-        map it to "default". Otherwise, assume it's a real Kyutai voice
-        name (fetched from /v1/voices) and pass it through unchanged.
+        Clients should use real Kyutai voice paths from /v1/voices API.
+        We no longer map OpenAI voice names - they'll be passed through
+        and the TTS will use its default if not recognized.
 
         Args:
-            voice: Voice name (OpenAI name like "alloy" or Kyutai name)
+            voice: Voice name or path
 
         Returns:
-            Kyutai voice name
+            Voice name unchanged
         """
-        # Only map standard OpenAI voice names to "default"
-        # Pass through all other voice names (assumed to be real Kyutai voices)
-        if voice in OPENAI_VOICE_NAMES:
-            return OPENAI_VOICE_MAPPING.get(voice, "default")
+        logger.info(f"Voice passthrough: '{voice}'")
         return voice
 
     def _map_kyutai_voice_to_openai(self, voice: str) -> str:
         """
-        Map Kyutai voice name back for OpenAI client responses.
-
-        If the voice is a standard OpenAI voice name, return it.
-        If it's "default", return "alloy".
-        Otherwise, it's a real Kyutai voice name - pass it through unchanged.
+        Pass through voice unchanged for OpenAI client responses.
 
         Args:
-            voice: Voice name
+            voice: Voice name or path
 
         Returns:
-            Voice name for OpenAI client
+            Voice name unchanged
         """
-        # If it's already an OpenAI voice name, return as-is
-        if voice in OPENAI_VOICE_NAMES:
-            return voice
-
-        # Map "default" back to "alloy" for OpenAI compatibility
-        if voice == "default":
-            return "alloy"
-
-        # Pass through real Kyutai voice names unchanged
         return voice
+
+    def _normalize_session_config(self, session: dict) -> dict:
+        """
+        Normalize OpenAI session config to Unmute internal format.
+
+        Handles both legacy (beta) format and GA (2025) format:
+        - Beta: voice at top level, turn_detection at top level
+        - GA: voice under audio.output.voice, turn_detection under audio.input.turn_detection
+
+        Args:
+            session: Session config dict from client
+
+        Returns:
+            Normalized session config dict for Unmute
+        """
+        # Handle GA format: extract voice from audio.output.voice
+        audio_config = session.get("audio", {})
+        output_config = audio_config.get("output", {})
+        input_config = audio_config.get("input", {})
+
+        # Extract voice from GA format if not at top level
+        if "voice" not in session and "voice" in output_config:
+            session["voice"] = output_config["voice"]
+            logger.info(f"Extracted voice from audio.output.voice: {session['voice']}")
+
+        # Map OpenAI voice to Kyutai voice
+        if "voice" in session:
+            original_voice = session["voice"]
+            session["voice"] = self._map_openai_voice_to_kyutai(session["voice"])
+            logger.info(f"OpenAI adapter: voice mapping '{original_voice}' -> '{session['voice']}'")
+
+        # Extract turn_detection from GA format if present (we log but don't use it currently)
+        if "turn_detection" in input_config:
+            logger.info(f"GA turn_detection config: {input_config['turn_detection']}")
+
+        # Remove GA-specific fields that Unmute doesn't understand
+        session.pop("audio", None)  # Remove nested audio config
+        session.pop("type", None)  # Remove session.type (GA field)
+        session.pop("modalities", None)  # Remove modalities (not used)
+
+        # Add allow_recording if not present (required by Unmute's SessionConfig)
+        if "allow_recording" not in session:
+            session["allow_recording"] = False
+
+        # Convert OpenAI string instructions to Unmute's ConstantInstructions format
+        if "instructions" in session and isinstance(session["instructions"], str):
+            session["instructions"] = {
+                "type": "constant",
+                "text": session["instructions"]
+            }
+
+        return session
 
     def translate_client_message(self, message_json: str) -> Union[ora.ClientEvent, None]:
         """
@@ -174,23 +198,9 @@ class OpenAIProtocolAdapter(ProtocolAdapter):
             # Handle session.create - OpenAI clients send this to initialize
             # Unmute doesn't have this event, so we convert it to session.update
             if message_type == "session.create":
-                # Extract session config
+                # Extract and normalize session config
                 session = message_dict.get("session", {})
-
-                # Map OpenAI voice to Kyutai voice
-                if "voice" in session:
-                    session["voice"] = self._map_openai_voice_to_kyutai(session["voice"])
-
-                # Add allow_recording if not present (required by Unmute's SessionConfig)
-                if "allow_recording" not in session:
-                    session["allow_recording"] = False
-
-                # Convert OpenAI string instructions to Unmute's ConstantInstructions format
-                if "instructions" in session and isinstance(session["instructions"], str):
-                    session["instructions"] = {
-                        "type": "constant",
-                        "text": session["instructions"]
-                    }
+                session = self._normalize_session_config(session)
 
                 # Convert to session.update
                 message_dict = {
@@ -233,20 +243,10 @@ class OpenAIProtocolAdapter(ProtocolAdapter):
                 # TODO: Support conversation item management
                 return None
 
-            # Handle session.update - map OpenAI voice to Kyutai voice and add required fields
+            # Handle session.update - normalize session config
             elif message_type == "session.update":
                 session = message_dict.get("session", {})
-                if "voice" in session:
-                    session["voice"] = self._map_openai_voice_to_kyutai(session["voice"])
-                # Add allow_recording if not present (required by Unmute's SessionConfig)
-                if "allow_recording" not in session:
-                    session["allow_recording"] = False
-                # Convert OpenAI string instructions to Unmute's ConstantInstructions format
-                if "instructions" in session and isinstance(session["instructions"], str):
-                    session["instructions"] = {
-                        "type": "constant",
-                        "text": session["instructions"]
-                    }
+                session = self._normalize_session_config(session)
                 message_dict["session"] = session
                 message_json = json.dumps(message_dict)
 

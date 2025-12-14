@@ -223,6 +223,37 @@
             color: #666;
             font-style: italic;
         }
+
+        .radio-group {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 15px;
+        }
+
+        .radio-option {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+        }
+
+        .radio-option input[type="radio"] {
+            width: auto;
+            cursor: pointer;
+        }
+
+        .radio-option label {
+            margin-bottom: 0;
+            cursor: pointer;
+        }
+
+        .api-key-group {
+            margin-bottom: 20px;
+        }
+
+        .hidden {
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -231,6 +262,29 @@
         <p class="subtitle">Connect to OpenAI Realtime API or unmute server (continuous listening)</p>
 
         <div class="input-group">
+            <label>Backend</label>
+            <div class="radio-group">
+                <div class="radio-option">
+                    <input type="radio" id="backendCustom" name="backend" value="custom" checked>
+                    <label for="backendCustom">Custom (Unmute)</label>
+                </div>
+                <div class="radio-option">
+                    <input type="radio" id="backendOpenAI" name="backend" value="openai">
+                    <label for="backendOpenAI">OpenAI</label>
+                </div>
+            </div>
+        </div>
+
+        <div class="input-group api-key-group hidden" id="apiKeyGroup">
+            <label for="apiKey">OpenAI API Key</label>
+            <input
+                type="password"
+                id="apiKey"
+                placeholder="sk-..."
+            >
+        </div>
+
+        <div class="input-group" id="wsUrlGroup">
             <label for="wsUrl">WebSocket URL</label>
             <input
                 type="text"
@@ -283,8 +337,8 @@
 
     <script>
         // Configuration
-        const SAMPLE_RATE = 24000;
-        const BUFFER_SIZE = 4096; // Must be power of 2 (4096 = ~170ms at 24kHz)
+        const TARGET_SAMPLE_RATE = 24000;  // Server expects 24kHz
+        const BUFFER_SIZE = 4096; // Must be power of 2
 
         // State
         let ws = null;
@@ -296,6 +350,7 @@
         let audioQueue = [];
         let isPlaying = false;
         let availableVoices = [];
+        let inputSampleRate = 48000;  // Will be set from audioContext
 
         // UI Elements
         const wsUrlInput = document.getElementById('wsUrl');
@@ -308,6 +363,50 @@
         const transcriptionDiv = document.getElementById('transcription');
         const visualizer = document.getElementById('visualizer');
         const micWarning = document.getElementById('micWarning');
+        const backendCustomRadio = document.getElementById('backendCustom');
+        const backendOpenAIRadio = document.getElementById('backendOpenAI');
+        const apiKeyGroup = document.getElementById('apiKeyGroup');
+        const apiKeyInput = document.getElementById('apiKey');
+        const wsUrlGroup = document.getElementById('wsUrlGroup');
+
+        // OpenAI standard voices
+        const OPENAI_VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'];
+        const CUSTOM_WS_URL = 'ws://localhost:8000/v1/realtime/openai';
+        const OPENAI_WS_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview';
+
+        // Backend switching
+        function getSelectedBackend() {
+            return document.querySelector('input[name="backend"]:checked').value;
+        }
+
+        function updateBackendUI() {
+            const backend = getSelectedBackend();
+            if (backend === 'openai') {
+                apiKeyGroup.classList.remove('hidden');
+                wsUrlGroup.classList.add('hidden');
+                wsUrlInput.value = OPENAI_WS_URL;
+                loadOpenAIVoices();
+            } else {
+                apiKeyGroup.classList.add('hidden');
+                wsUrlGroup.classList.remove('hidden');
+                wsUrlInput.value = CUSTOM_WS_URL;
+                fetchVoices();
+            }
+        }
+
+        function loadOpenAIVoices() {
+            voiceSelect.innerHTML = '';
+            OPENAI_VOICES.forEach(voice => {
+                const option = document.createElement('option');
+                option.value = voice;
+                option.textContent = voice.charAt(0).toUpperCase() + voice.slice(1);
+                voiceSelect.appendChild(option);
+            });
+        }
+
+        // Backend radio event listeners
+        backendCustomRadio.addEventListener('change', updateBackendUI);
+        backendOpenAIRadio.addEventListener('change', updateBackendUI);
 
         // Create visualizer bars
         for (let i = 0; i < 20; i++) {
@@ -331,7 +430,8 @@
                 }
 
                 const data = await response.json();
-                availableVoices = data.voices || [];
+                // API returns array directly, not {voices: [...]}
+                availableVoices = Array.isArray(data) ? data : (data.voices || []);
 
                 // Filter to only "good" voices (like frontend does)
                 const goodVoices = availableVoices.filter(v => v.good === true);
@@ -340,9 +440,13 @@
                 voiceSelect.innerHTML = '';
 
                 if (goodVoices.length > 0) {
+                    console.log('Populating voice select with', goodVoices.length, 'good voices');
                     goodVoices.forEach(voice => {
                         const option = document.createElement('option');
-                        option.value = voice.name;
+                        // Use path_on_server as value (what TTS expects), name for display
+                        const voiceValue = voice.source?.path_on_server || voice.name;
+                        console.log(`Voice: ${voice.name} -> value: ${voiceValue}`);
+                        option.value = voiceValue;
                         option.textContent = voice.name;
                         voiceSelect.appendChild(option);
                     });
@@ -350,7 +454,8 @@
                     // Fall back to all voices if no "good" ones
                     availableVoices.forEach(voice => {
                         const option = document.createElement('option');
-                        option.value = voice.name;
+                        // Use path_on_server as value (what TTS expects), name for display
+                        option.value = voice.source?.path_on_server || voice.name;
                         option.textContent = voice.name;
                         voiceSelect.appendChild(option);
                     });
@@ -365,25 +470,14 @@
         }
 
         function addDefaultVoices() {
-            // Fallback OpenAI voice names
-            const defaultVoices = [
-                { value: 'alloy', text: 'Alloy (Neutral, balanced)' },
-                { value: 'echo', text: 'Echo (Resonant, clear)' },
-                { value: 'shimmer', text: 'Shimmer (Energetic, bright)' },
-                { value: 'ash', text: 'Ash (Clear, expressive)' },
-                { value: 'ballad', text: 'Ballad (Deep, calm)' },
-                { value: 'coral', text: 'Coral (Warm, friendly)' },
-                { value: 'sage', text: 'Sage (Soft, articulate)' },
-                { value: 'verse', text: 'Verse (Conversational, engaging)' },
-            ];
-
+            // No fallback voices - must use real Kyutai voices from /v1/voices API
             voiceSelect.innerHTML = '';
-            defaultVoices.forEach(voice => {
-                const option = document.createElement('option');
-                option.value = voice.value;
-                option.textContent = voice.text;
-                voiceSelect.appendChild(option);
-            });
+            const option = document.createElement('option');
+            option.value = '';
+            option.textContent = 'Failed to load voices - check connection';
+            option.disabled = true;
+            voiceSelect.appendChild(option);
+            console.error('Failed to load voices from API');
         }
 
         // Update status
@@ -420,9 +514,34 @@
             return float32Array;
         }
 
-        // Base64 encode PCM16
-        function encodePCM16(float32Array) {
-            const int16Array = float32ToInt16(float32Array);
+        // Resample audio from one sample rate to another using linear interpolation
+        function resample(inputArray, inputRate, outputRate) {
+            if (inputRate === outputRate) {
+                return inputArray;
+            }
+
+            const ratio = inputRate / outputRate;
+            const outputLength = Math.round(inputArray.length / ratio);
+            const output = new Float32Array(outputLength);
+
+            for (let i = 0; i < outputLength; i++) {
+                const srcIndex = i * ratio;
+                const srcIndexFloor = Math.floor(srcIndex);
+                const srcIndexCeil = Math.min(srcIndexFloor + 1, inputArray.length - 1);
+                const t = srcIndex - srcIndexFloor;
+
+                // Linear interpolation
+                output[i] = inputArray[srcIndexFloor] * (1 - t) + inputArray[srcIndexCeil] * t;
+            }
+
+            return output;
+        }
+
+        // Base64 encode PCM16 (with resampling to target rate)
+        function encodePCM16(float32Array, fromRate, toRate) {
+            // Resample if needed
+            const resampled = resample(float32Array, fromRate, toRate);
+            const int16Array = float32ToInt16(resampled);
             const bytes = new Uint8Array(int16Array.buffer);
             return btoa(String.fromCharCode(...bytes));
         }
@@ -438,12 +557,15 @@
             return int16ToFloat32(int16Array);
         }
 
-        // Play audio
+        // Play audio (resamples from server rate to browser rate if needed)
         async function playAudio(float32Array) {
             if (!audioContext) return;
 
-            const audioBuffer = audioContext.createBuffer(1, float32Array.length, SAMPLE_RATE);
-            audioBuffer.getChannelData(0).set(float32Array);
+            // Resample from server's 24kHz to browser's native rate for playback
+            const resampled = resample(float32Array, TARGET_SAMPLE_RATE, inputSampleRate);
+
+            const audioBuffer = audioContext.createBuffer(1, resampled.length, inputSampleRate);
+            audioBuffer.getChannelData(0).set(resampled);
 
             const source = audioContext.createBufferSource();
             source.buffer = audioBuffer;
@@ -472,10 +594,9 @@
             if (isListening) return;
 
             try {
-                // Request microphone access
+                // Request microphone access (don't request sample rate - browsers ignore it)
                 micStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
-                        sampleRate: SAMPLE_RATE,
                         echoCancellation: true,
                         noiseSuppression: true,
                         autoGainControl: true,
@@ -492,7 +613,8 @@
                     if (isMuted) return; // Don't send audio when muted
 
                     const inputData = e.inputBuffer.getChannelData(0);
-                    const base64Audio = encodePCM16(inputData);
+                    // Resample from browser's native rate to server's 24kHz
+                    const base64Audio = encodePCM16(inputData, inputSampleRate, TARGET_SAMPLE_RATE);
 
                     // Send to server
                     ws.send(JSON.stringify({
@@ -508,7 +630,7 @@
                 audioProcessor.connect(audioContext.destination);
 
                 isListening = true;
-                updateStatus('Listening...', 'listening');
+                updateStatus(`Listening... (resampling ${inputSampleRate}Hz → ${TARGET_SAMPLE_RATE}Hz)`, 'listening');
 
             } catch (error) {
                 console.error('Microphone error:', error);
@@ -551,16 +673,32 @@
         // Connect to WebSocket
         async function connect() {
             try {
-                // Initialize audio context
+                // Initialize audio context (let browser choose sample rate)
                 if (!audioContext) {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                        sampleRate: SAMPLE_RATE
-                    });
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    // Capture the actual sample rate the browser is using
+                    inputSampleRate = audioContext.sampleRate;
+                    console.log(`Browser audio sample rate: ${inputSampleRate}Hz`);
                 }
 
                 updateStatus('Connecting...', 'connecting');
 
-                ws = new WebSocket(wsUrlInput.value, ['realtime']);
+                // Build WebSocket with appropriate subprotocols
+                const backend = getSelectedBackend();
+                let subprotocols = ['realtime'];
+
+                if (backend === 'openai') {
+                    const apiKey = apiKeyInput.value.trim();
+                    if (!apiKey) {
+                        updateStatus('API key required for OpenAI', 'disconnected');
+                        addMessage('Please enter your OpenAI API key', 'system');
+                        return;
+                    }
+                    // OpenAI accepts API key via subprotocol header
+                    subprotocols = [`openai-insecure-api-key.${apiKey}`, 'realtime'];
+                }
+
+                ws = new WebSocket(wsUrlInput.value, subprotocols);
 
                 ws.onopen = async () => {
                     updateStatus('Connected', 'connected');
@@ -569,33 +707,81 @@
                     muteBtn.disabled = false;
 
                     // Send session.update with tools
+                    const isOpenAI = getSelectedBackend() === 'openai';
+                    const sessionConfig = {
+                        voice: voiceSelect.value,
+                        instructions: instructionsInput.value || undefined,
+                        tools: [
+                            {
+                                type: 'function',
+                                name: 'open_url',
+                                description: 'Open a URL in a new browser tab. Use this when the user asks to open a website, link, or webpage.',
+                                parameters: {
+                                    type: 'object',
+                                    properties: {
+                                        url: {
+                                            type: 'string',
+                                            description: 'The URL to open (must include http:// or https://)'
+                                        }
+                                    },
+                                    required: ['url']
+                                }
+                            }
+                        ],
+                        tool_choice: 'auto'
+                    };
+
+                    // OpenAI requires different structure in GA API (2025)
+                    if (isOpenAI) {
+                        // GA API format - audio settings nested under audio.input/output
+                        sessionConfig.type = 'realtime';  // Required: 'realtime' for speech-to-speech
+                        sessionConfig.audio = {
+                            input: {
+                                turn_detection: {
+                                    type: 'server_vad',
+                                    silence_duration_ms: 500,
+                                    create_response: true
+                                }
+                            },
+                            output: {
+                                voice: voiceSelect.value
+                            }
+                        };
+                        // Tools in GA API use flat format (not nested under 'function')
+                        sessionConfig.tools = [
+                            {
+                                type: 'function',
+                                name: 'open_url',
+                                description: 'Open a URL in a new browser tab. Use this when the user asks to open a website, link, or webpage.',
+                                parameters: {
+                                    type: 'object',
+                                    properties: {
+                                        url: {
+                                            type: 'string',
+                                            description: 'The URL to open (must include http:// or https://)'
+                                        }
+                                    },
+                                    required: ['url']
+                                }
+                            }
+                        ];
+                        sessionConfig.tool_choice = 'auto';
+                        // Remove top-level fields not valid in GA API
+                        delete sessionConfig.voice;
+                        delete sessionConfig.turn_detection;
+                    }
+
                     const sessionUpdate = {
                         type: 'session.update',
-                        session: {
-                            voice: voiceSelect.value,
-                            instructions: instructionsInput.value || undefined,
-                            tools: [
-                                {
-                                    type: 'function',
-                                    name: 'open_url',
-                                    description: 'Open a URL in a new browser tab. Use this when the user asks to open a website, link, or webpage.',
-                                    parameters: {
-                                        type: 'object',
-                                        properties: {
-                                            url: {
-                                                type: 'string',
-                                                description: 'The URL to open (must include http:// or https://)'
-                                            }
-                                        },
-                                        required: ['url']
-                                    }
-                                }
-                            ],
-                            tool_choice: 'auto'
-                        }
+                        session: sessionConfig
                     };
+                    console.log('Sending session.update with voice:', voiceSelect.value);
+                    console.log('Session update:', JSON.stringify(sessionUpdate, null, 2));
                     ws.send(JSON.stringify(sessionUpdate));
-                    addMessage('system', `Connected with voice: ${voiceSelect.value} (tools enabled)`);
+                    const selectedOption = voiceSelect.options[voiceSelect.selectedIndex];
+                    const voiceName = selectedOption?.textContent || 'unknown';
+                    const voicePath = voiceSelect.value;
+                    addMessage('system', `Connected: voice="${voiceName}" (${voicePath}), audio ${inputSampleRate}Hz→${TARGET_SAMPLE_RATE}Hz`);
 
                     // Start continuous listening automatically
                     await startListening();
@@ -605,16 +791,105 @@
                     const message = JSON.parse(event.data);
 
                     switch (message.type) {
+                        // === Session Events ===
+                        case 'session.created':
+                            console.log('Session created:', message.session);
+                            break;
+
                         case 'session.updated':
                             addMessage('system', 'Session configured');
+                            break;
+
+                        // === Conversation Events ===
+                        case 'conversation.created':
+                            console.log('Conversation created:', message.conversation);
+                            break;
+
+                        case 'conversation.item.added':
+                            // New conversation item added
+                            console.log('Conversation item added:', message.item?.type);
+                            break;
+
+                        case 'conversation.item.done':
+                            // Conversation item complete
+                            console.log('Conversation item done:', message.item?.type);
                             break;
 
                         case 'conversation.item.input_audio_transcription.delta':
                             // User transcription - could display partial transcription
                             break;
 
+                        case 'conversation.item.input_audio_transcription.completed':
+                            // User transcription complete
+                            if (message.transcript) {
+                                addMessage('user', message.transcript);
+                            }
+                            break;
+
+                        // === Input Audio Buffer Events ===
+                        case 'input_audio_buffer.speech_started':
+                            addMessage('system', 'Speech detected');
+                            break;
+
+                        case 'input_audio_buffer.speech_stopped':
+                            addMessage('system', 'Speech stopped');
+                            break;
+
+                        case 'input_audio_buffer.committed':
+                            console.log('Input audio buffer committed:', message.item_id);
+                            break;
+
+                        // === Response Events ===
+                        case 'response.created':
+                            // addMessage('assistant', 'Thinking...');
+                            console.log('Response created:', message.response?.id);
+                            break;
+
+                        case 'response.done':
+                            // Full response complete
+                            console.log('Response done:', message.response?.id);
+                            break;
+
+                        // === Audio Output Events (Unmute format) ===
+                        case 'response.audio.delta':
+                            // Decode and queue audio (Unmute format)
+                            const audioDataUnmute = decodePCM16(message.delta);
+                            audioQueue.push(audioDataUnmute);
+                            processAudioQueue();
+                            updateVisualizer(audioDataUnmute);
+                            break;
+
+                        case 'response.audio.done':
+                            // Audio response complete (Unmute format)
+                            break;
+
+                        // === Audio Output Events (OpenAI GA format) ===
+                        case 'response.output_audio.delta':
+                            // Decode and queue audio (OpenAI GA format)
+                            const audioDataOAI = decodePCM16(message.delta);
+                            audioQueue.push(audioDataOAI);
+                            processAudioQueue();
+                            updateVisualizer(audioDataOAI);
+                            break;
+
+                        case 'response.output_audio.done':
+                            // Audio response complete (OpenAI GA format)
+                            break;
+
+                        case 'response.output_audio_transcript.delta':
+                            // OpenAI sends transcript deltas separately
+                            break;
+
+                        case 'response.output_audio_transcript.done':
+                            // OpenAI audio transcript complete
+                            if (message.transcript) {
+                                addMessage('assistant', message.transcript);
+                            }
+                            break;
+
+                        // === Text Output Events (Unmute format) ===
                         case 'response.text.delta':
-                            // Assistant text delta - could show streaming text
+                            // Assistant text delta
                             break;
 
                         case 'response.text.done':
@@ -624,36 +899,28 @@
                             }
                             break;
 
-                        case 'response.audio.done':
-                            // Audio response complete
+                        // === Text Output Events (OpenAI GA format) ===
+                        case 'response.output_text.delta':
+                            // OpenAI GA text delta
                             break;
 
-                        case 'response.done':
-                            // Full response complete
+                        case 'response.output_text.done':
+                            // OpenAI GA text complete
+                            if (message.text) {
+                                addMessage('assistant', message.text);
+                            }
                             break;
 
-                        case 'response.audio.delta':
-                            // Decode and queue audio
-                            const audioData = decodePCM16(message.delta);
-                            audioQueue.push(audioData);
-                            processAudioQueue();
-
-                            // Animate visualizer
-                            updateVisualizer(audioData);
+                        // === Content Part Events (OpenAI GA) ===
+                        case 'response.content_part.added':
+                            console.log('Content part added:', message.part?.type);
                             break;
 
-                        case 'input_audio_buffer.speech_started':
-                            addMessage('system', 'Speech detected');
+                        case 'response.content_part.done':
+                            console.log('Content part done:', message.part?.type);
                             break;
 
-                        case 'input_audio_buffer.speech_stopped':
-                            addMessage('system', 'Speech stopped');
-                            break;
-
-                        case 'response.created':
-                            addMessage('assistant', 'Thinking...');
-                            break;
-
+                        // === Output Item Events ===
                         case 'response.output_item.added':
                             // Function call starting
                             if (message.item?.type === 'function_call') {
@@ -661,22 +928,33 @@
                             }
                             break;
 
+                        case 'response.output_item.done':
+                            // Output item complete - handle function calls here (per OpenAI docs)
+                            if (message.item?.type === 'function_call') {
+                                console.log('Function call complete:', message.item);
+                                // Execute the function with the complete arguments
+                                handleFunctionCall(message.item.call_id, message.item.id, message.item.arguments);
+                            }
+                            break;
+
+                        // === Function Calling Events ===
                         case 'response.function_call_arguments.delta':
                             // Streaming function arguments (could show progress)
                             break;
 
                         case 'response.function_call_arguments.done':
-                            // Function arguments complete - execute the function
-                            handleFunctionCall(message.call_id, message.item_id, message.arguments);
+                            // Function arguments complete (alternative to output_item.done)
+                            // Only execute if not already handled by output_item.done
+                            // The output_item.done event is the recommended handler
+                            console.log('Function call arguments done:', message.call_id);
                             break;
 
-                        case 'response.output_item.done':
-                            // Function call item complete
-                            if (message.item?.type === 'function_call') {
-                                console.log('Function call complete:', message.item);
-                            }
+                        // === Rate Limits ===
+                        case 'rate_limits.updated':
+                            console.log('Rate limits updated:', message.rate_limits);
                             break;
 
+                        // === Error Events ===
                         case 'error':
                             const errMsg = message.error?.message || JSON.stringify(message.error) || JSON.stringify(message);
                             addMessage('system', `Error: ${errMsg}`);
@@ -817,6 +1095,22 @@
             if (e.code === 'KeyM' && !muteBtn.disabled) {
                 e.preventDefault();
                 toggleMute();
+            }
+        });
+
+        // Load API key from localStorage
+        const savedApiKey = localStorage.getItem('openai_api_key');
+        if (savedApiKey) {
+            apiKeyInput.value = savedApiKey;
+        }
+
+        // Save API key to localStorage when changed
+        apiKeyInput.addEventListener('change', () => {
+            const key = apiKeyInput.value.trim();
+            if (key) {
+                localStorage.setItem('openai_api_key', key);
+            } else {
+                localStorage.removeItem('openai_api_key');
             }
         });
 

@@ -134,38 +134,37 @@ class TestOpenAIProtocolAdapter:
         assert config["model"] == "gpt-4o-realtime-preview"
         assert config["bandwidth_multiplier"] == 1.0
 
-    def test_voice_mapping_openai_to_kyutai(self):
-        """Test OpenAI voice names map to Kyutai voices."""
+    def test_voice_passthrough_openai_to_kyutai(self):
+        """Test that all voice names pass through unchanged (no mapping)."""
         adapter = OpenAIProtocolAdapter()
 
-        # Standard OpenAI voices map to "default"
-        assert adapter._map_openai_voice_to_kyutai("alloy") == "default"
-        assert adapter._map_openai_voice_to_kyutai("echo") == "default"
-        assert adapter._map_openai_voice_to_kyutai("shimmer") == "default"
-        # Non-OpenAI voice names (real Kyutai voices) pass through unchanged
+        # All voices pass through unchanged - no mapping
+        assert adapter._map_openai_voice_to_kyutai("alloy") == "alloy"
+        assert adapter._map_openai_voice_to_kyutai("echo") == "echo"
+        assert adapter._map_openai_voice_to_kyutai("shimmer") == "shimmer"
+        # Kyutai voice paths pass through unchanged
+        assert adapter._map_openai_voice_to_kyutai("unmute-prod-website/p329_022.wav") == "unmute-prod-website/p329_022.wav"
         assert adapter._map_openai_voice_to_kyutai("some_kyutai_voice") == "some_kyutai_voice"
 
-    def test_voice_mapping_kyutai_to_openai(self):
-        """Test Kyutai voice names map back for OpenAI clients."""
+    def test_voice_passthrough_kyutai_to_openai(self):
+        """Test that all voice names pass through unchanged for OpenAI clients."""
         adapter = OpenAIProtocolAdapter()
 
-        # OpenAI voices should pass through as-is
+        # All voices pass through unchanged - no mapping back
         assert adapter._map_kyutai_voice_to_openai("alloy") == "alloy"
-
-        # "default" maps to "alloy" for OpenAI compatibility
-        assert adapter._map_kyutai_voice_to_openai("default") == "alloy"
-        # Real Kyutai voice names pass through unchanged
+        assert adapter._map_kyutai_voice_to_openai("default") == "default"
+        assert adapter._map_kyutai_voice_to_openai("unmute-prod-website/p329_022.wav") == "unmute-prod-website/p329_022.wav"
         assert adapter._map_kyutai_voice_to_openai("custom_voice") == "custom_voice"
 
     def test_translate_session_create_to_update(self):
         """Test that session.create is converted to session.update."""
         adapter = OpenAIProtocolAdapter()
 
-        # OpenAI clients send session.create with simple voice setting
+        # OpenAI clients send session.create with voice setting
         message_dict = {
             "type": "session.create",
             "session": {
-                "voice": "echo",
+                "voice": "unmute-prod-website/p329_022.wav",
                 "allow_recording": False,
             },
         }
@@ -174,18 +173,18 @@ class TestOpenAIProtocolAdapter:
         # Translate
         translated = adapter.translate_client_message(message_json)
 
-        # Should be converted to session.update with voice mapping
+        # Should be converted to session.update with voice passed through
         assert isinstance(translated, ora.SessionUpdate)
-        assert translated.session.voice == "default"  # echo → default
+        assert translated.session.voice == "unmute-prod-website/p329_022.wav"
 
-    def test_translate_session_update_voice_mapping(self):
-        """Test that session.update maps voice names."""
+    def test_translate_session_update_voice_passthrough(self):
+        """Test that session.update passes voice names through unchanged."""
         adapter = OpenAIProtocolAdapter()
 
         message_dict = {
             "type": "session.update",
             "session": {
-                "voice": "shimmer",
+                "voice": "unmute-prod-website/sarah_001.wav",
                 "allow_recording": False,
             },
         }
@@ -194,9 +193,111 @@ class TestOpenAIProtocolAdapter:
         # Translate
         translated = adapter.translate_client_message(message_json)
 
-        # Voice should be mapped
+        # Voice should pass through unchanged
         assert isinstance(translated, ora.SessionUpdate)
-        assert translated.session.voice == "default"
+        assert translated.session.voice == "unmute-prod-website/sarah_001.wav"
+
+    def test_translate_session_update_ga_format(self):
+        """Test that session.update with GA format (voice under audio.output) works."""
+        adapter = OpenAIProtocolAdapter()
+
+        # GA API format: voice is nested under audio.output
+        message_dict = {
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "audio": {
+                    "input": {
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "silence_duration_ms": 500
+                        }
+                    },
+                    "output": {
+                        "voice": "alloy"
+                    }
+                },
+                "instructions": "You are a helpful assistant.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "test_tool",
+                        "description": "A test tool",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    }
+                ],
+                "tool_choice": "auto"
+            },
+        }
+        message_json = json.dumps(message_dict)
+
+        # Translate
+        translated = adapter.translate_client_message(message_json)
+
+        # Should extract voice from audio.output.voice
+        assert isinstance(translated, ora.SessionUpdate)
+        assert translated.session.voice == "alloy"
+        # Tools should pass through
+        assert translated.session.tools is not None
+        assert len(translated.session.tools) == 1
+        assert translated.session.tools[0].get_name() == "test_tool"
+        # Instructions should be converted to ConstantInstructions format
+        assert translated.session.instructions is not None
+
+    def test_translate_session_create_ga_format(self):
+        """Test that session.create with GA format works."""
+        adapter = OpenAIProtocolAdapter()
+
+        # GA API format for session.create
+        message_dict = {
+            "type": "session.create",
+            "session": {
+                "type": "realtime",
+                "audio": {
+                    "output": {
+                        "voice": "shimmer"
+                    }
+                },
+                "modalities": ["text", "audio"],
+            },
+        }
+        message_json = json.dumps(message_dict)
+
+        # Translate
+        translated = adapter.translate_client_message(message_json)
+
+        # Should be converted to session.update with voice extracted
+        assert isinstance(translated, ora.SessionUpdate)
+        assert translated.session.voice == "shimmer"
+
+    def test_normalize_session_config_strips_ga_fields(self):
+        """Test that GA-specific fields are stripped during normalization."""
+        adapter = OpenAIProtocolAdapter()
+
+        session = {
+            "type": "realtime",
+            "modalities": ["text", "audio"],
+            "audio": {
+                "input": {"turn_detection": {"type": "server_vad"}},
+                "output": {"voice": "coral"}
+            },
+            "voice": "should_be_overwritten",  # Top-level voice should NOT be overwritten
+            "instructions": "Test instructions",
+        }
+
+        normalized = adapter._normalize_session_config(session)
+
+        # GA-specific fields should be removed
+        assert "type" not in normalized
+        assert "modalities" not in normalized
+        assert "audio" not in normalized
+        # Top-level voice should be kept (not overwritten by audio.output.voice)
+        assert normalized["voice"] == "should_be_overwritten"
+        # allow_recording should be added
+        assert normalized["allow_recording"] is False
 
     def test_translate_response_create_passed_through(self):
         """Test that response.create is passed through (for tool calling support)."""
@@ -262,15 +363,15 @@ class TestOpenAIProtocolAdapter:
         assert translated_dict["type"] == "response.text.delta"
         assert translated_dict["delta"] == "Hello"
 
-    def test_translate_session_updated_voice_mapping(self):
-        """Test that session.updated maps voice back to OpenAI names."""
+    def test_translate_session_updated_voice_passthrough(self):
+        """Test that session.updated passes voice through unchanged."""
         adapter = OpenAIProtocolAdapter()
 
-        # Create session.updated with Kyutai voice
+        # Create session.updated with Kyutai voice path
         event = ora.SessionUpdated(
             session=ora.SessionConfig(
                 instructions=None,
-                voice="default",
+                voice="unmute-prod-website/p329_022.wav",
                 allow_recording=False,
             )
         )
@@ -279,18 +380,18 @@ class TestOpenAIProtocolAdapter:
         translated_json = adapter.translate_server_event(event)
         translated_dict = json.loads(translated_json)
 
-        # Voice should be mapped back to OpenAI name
-        assert translated_dict["session"]["voice"] == "alloy"
+        # Voice should pass through unchanged
+        assert translated_dict["session"]["voice"] == "unmute-prod-website/p329_022.wav"
 
-    def test_translate_response_created_voice_mapping(self):
-        """Test that response.created maps voice back to OpenAI names."""
+    def test_translate_response_created_voice_passthrough(self):
+        """Test that response.created passes voice through unchanged."""
         adapter = OpenAIProtocolAdapter()
 
-        # Create response.created with Kyutai voice
+        # Create response.created with Kyutai voice path
         event = ora.ResponseCreated(
             response=ora.Response(
                 status="in_progress",
-                voice="default",
+                voice="unmute-prod-website/sarah_001.wav",
             )
         )
 
@@ -298,8 +399,8 @@ class TestOpenAIProtocolAdapter:
         translated_json = adapter.translate_server_event(event)
         translated_dict = json.loads(translated_json)
 
-        # Voice should be mapped back
-        assert translated_dict["response"]["voice"] == "alloy"
+        # Voice should pass through unchanged
+        assert translated_dict["response"]["voice"] == "unmute-prod-website/sarah_001.wav"
 
     @pytest.mark.asyncio
     async def test_decode_audio_pcm16(self):
